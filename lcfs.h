@@ -19,7 +19,6 @@
 
 typedef uint64_t lcfs_oid_t;
 
-// Tipos de objeto
 enum lcfs_obj_type {
     OBJ_TYPE_FILE = 0x0001,
     OBJ_TYPE_DIR = 0x0002,
@@ -31,21 +30,19 @@ enum lcfs_obj_type {
     OBJ_TYPE_SUPERBLOCK = 0x0008,
 };
 
-// Flags
 #define OBJ_FLAG_DIRTY 0x01
 #define OBJ_FLAG_SPARSE 0x02
 #define OBJ_FLAG_HAS_DATA_CRC 0x04
 #define OBJ_FLAG_DELETED 0x08
 
-// Encabezado de objeto (64 bytes)
 typedef struct {
     uint8_t  magic[8];
     uint64_t oid;
     uint16_t type;
     uint16_t version;
-    uint32_t size;          // Tamaño lógico en bytes
-    uint32_t num_extents;   // Número de extents (bloques lógicos) si aplica
-    uint32_t header_crc;    // CRC32C del encabezado (campo header_crc en cero)
+    uint32_t size;
+    uint32_t num_extents;
+    uint32_t header_crc;
     uint32_t flags;
     uint64_t parent_oid;
     uint64_t next_sibling_oid;
@@ -53,21 +50,18 @@ typedef struct {
     uint32_t generation;
 } __attribute__((packed)) lcfs_obj_header;
 
-// Entrada de directorio
 typedef struct {
     uint64_t child_oid;
     uint16_t child_type;
     uint16_t name_len;
-    // seguido de name bytes
 } __attribute__((packed)) lcfs_dir_entry;
 
-// Extent
 typedef struct {
     uint64_t logical_block;
     uint64_t physical_block;
 } __attribute__((packed)) lcfs_extent;
 
-// Funciones de la librería
+/* Funciones de la librería */
 uint32_t lcfs_crc32c(uint32_t crc, const void *buf, size_t len);
 int lcfs_read_header(int fd, uint64_t block_num, lcfs_obj_header *hdr);
 int lcfs_write_header(int fd, uint64_t block_num, const lcfs_obj_header *hdr);
@@ -96,5 +90,13 @@ int lcfs_readlink(int fd, lcfs_oid_t oid, char *buf, size_t bufsize);
 int lcfs_object_location(int fd, lcfs_oid_t oid, uint64_t *block_num);
 int lcfs_rebuild_free_map(int fd, uint8_t **bitmap, uint64_t *bitmap_blocks);
 int lcfs_rebuild_oid_map(int fd);
+int lcfs_oid_map_add(int fd, lcfs_oid_t oid, uint64_t block);
+int lcfs_oid_map_remove(int fd, lcfs_oid_t oid);
+int lcfs_create_dir(int fd, lcfs_oid_t parent_oid, const char *name, lcfs_oid_t *new_oid);
+int lcfs_create_symlink(int fd, lcfs_oid_t parent_oid, const char *name, const char *target, lcfs_oid_t *new_oid);
+int lcfs_rename(int fd, lcfs_oid_t old_parent, const char *old_name,
+                lcfs_oid_t new_parent, const char *new_name);
+int lcfs_unlink(int fd, lcfs_oid_t parent_oid, const char *name);
+int lcfs_validate_header(const lcfs_obj_header *hdr);
 
 #endif

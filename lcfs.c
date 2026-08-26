@@ -1,4 +1,7 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "lcfs.h"
+#include "debug.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,9 +10,10 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <time.h>
 #include <assert.h>
 
-// CRC32C (Castagnoli)
+/* CRC32C (Castagnoli) */
 static uint32_t crc32c_table[256];
 static int crc32c_initialized = 0;
 
@@ -40,46 +44,85 @@ static uint32_t header_crc(const lcfs_obj_header *hdr) {
     return lcfs_crc32c(0, &tmp, sizeof(tmp));
 }
 
+int lcfs_validate_header(const lcfs_obj_header *hdr) {
+    if (memcmp(hdr->magic, LCFS_MAGIC, LCFS_MAGIC_LEN) != 0) return -1;
+    lcfs_obj_header tmp = *hdr;
+    tmp.header_crc = 0;
+    uint32_t crc = lcfs_crc32c(0, &tmp, sizeof(tmp));
+    return (hdr->header_crc == crc) ? 0 : -1;
+}
+
 int lcfs_read_block(int fd, uint64_t block_num, void *buf) {
+    DEBUG_ENTER();
+    DEBUG_PRINT("Leyendo bloque %llu", block_num);
     off_t off = (off_t)block_num * LCFS_BLOCK_SIZE;
-    if (lseek(fd, off, SEEK_SET) < 0) return -1;
-    if (read(fd, buf, LCFS_BLOCK_SIZE) != LCFS_BLOCK_SIZE) return -1;
+    if (lseek(fd, off, SEEK_SET) < 0) {
+        DEBUG_ERROR("lseek falló para bloque %llu", block_num);
+        return -1;
+    }
+    if (read(fd, buf, LCFS_BLOCK_SIZE) != LCFS_BLOCK_SIZE) {
+        DEBUG_ERROR("read falló para bloque %llu", block_num);
+        return -1;
+    }
+    DEBUG_EXIT(0);
     return 0;
 }
 
 int lcfs_write_block(int fd, uint64_t block_num, const void *buf) {
+    DEBUG_ENTER();
+    DEBUG_PRINT("Escribiendo bloque %llu", block_num);
+    uint8_t block[LCFS_BLOCK_SIZE] = {0};
+    memcpy(block, buf, LCFS_BLOCK_SIZE);
     off_t off = (off_t)block_num * LCFS_BLOCK_SIZE;
-    if (lseek(fd, off, SEEK_SET) < 0) return -1;
-    if (write(fd, buf, LCFS_BLOCK_SIZE) != LCFS_BLOCK_SIZE) return -1;
+    if (lseek(fd, off, SEEK_SET) < 0) {
+        DEBUG_ERROR("lseek falló para bloque %llu", block_num);
+        return -1;
+    }
+    if (write(fd, block, LCFS_BLOCK_SIZE) != LCFS_BLOCK_SIZE) {
+        DEBUG_ERROR("write falló para bloque %llu", block_num);
+        return -1;
+    }
+    DEBUG_EXIT(0);
     return 0;
 }
 
 int lcfs_read_header(int fd, uint64_t block_num, lcfs_obj_header *hdr) {
+    DEBUG_ENTER();
+    DEBUG_PRINT("Leyendo encabezado del bloque %llu", block_num);
     uint8_t block[LCFS_BLOCK_SIZE];
     if (lcfs_read_block(fd, block_num, block) < 0) return -1;
     memcpy(hdr, block, sizeof(*hdr));
     if (memcmp(hdr->magic, LCFS_MAGIC, LCFS_MAGIC_LEN) != 0) {
+        DEBUG_ERROR("Firma mágica incorrecta en bloque %llu", block_num);
         errno = EINVAL;
         return -1;
     }
     if (hdr->header_crc != header_crc(hdr)) {
+        DEBUG_ERROR("CRC incorrecto en bloque %llu (esperado 0x%x, leído 0x%x)",
+                    block_num, hdr->header_crc, header_crc(hdr));
         errno = EBADMSG;
         return -1;
     }
+    DEBUG_EXIT(0);
     return 0;
 }
 
 int lcfs_write_header(int fd, uint64_t block_num, const lcfs_obj_header *hdr) {
+    DEBUG_ENTER();
+    DEBUG_PRINT("Escribiendo encabezado en bloque %llu (oid=%llu, type=%u)",
+                block_num, hdr->oid, hdr->type);
     lcfs_obj_header tmp = *hdr;
     tmp.header_crc = 0;
     tmp.header_crc = header_crc(&tmp);
     uint8_t block[LCFS_BLOCK_SIZE] = {0};
     memcpy(block, &tmp, sizeof(tmp));
     if (lcfs_write_block(fd, block_num, block) < 0) return -1;
+    DEBUG_EXIT(0);
     return 0;
 }
 
 int lcfs_read_object_name(int fd, uint64_t block_num, char *name, size_t max_len) {
+    DEBUG_ENTER();
     uint8_t block[LCFS_BLOCK_SIZE];
     if (lcfs_read_block(fd, block_num, block) < 0) return -1;
     uint16_t name_len;
@@ -87,11 +130,15 @@ int lcfs_read_object_name(int fd, uint64_t block_num, char *name, size_t max_len
     if (name_len >= max_len) name_len = max_len - 1;
     memcpy(name, block + LCFS_HEADER_SIZE + 2, name_len);
     name[name_len] = '\0';
+    DEBUG_PRINT("Nombre en bloque %llu: '%s' (len=%u)", block_num, name, name_len);
+    DEBUG_EXIT(0);
     return 0;
 }
 
 int lcfs_init_superblock(int fd, uint64_t total_blocks) {
-    // Superbloque en bloque 0
+    DEBUG_ENTER();
+    DEBUG_PRINT("Inicializando superblock con %llu bloques totales", total_blocks);
+
     lcfs_obj_header sb;
     memset(&sb, 0, sizeof(sb));
     memcpy(sb.magic, LCFS_MAGIC, LCFS_MAGIC_LEN);
@@ -102,18 +149,22 @@ int lcfs_init_superblock(int fd, uint64_t total_blocks) {
     sb.num_extents = 0;
     sb.flags = 0;
     sb.parent_oid = 0;
-    sb.generation = 1;
+    sb.generation = 4;
     sb.header_crc = 0;
     sb.header_crc = header_crc(&sb);
-    if (lcfs_write_block(fd, 0, &sb) < 0) return -1;
+    if (lcfs_write_header(fd, 0, &sb) < 0) {
+        DEBUG_ERROR("No se pudo escribir el superbloque en bloque 0");
+        return -1;
+    }
 
-    // Crear free map en bloque 1
     uint64_t bm_blocks = (total_blocks + LCFS_BLOCK_SIZE*8 - 1) / (LCFS_BLOCK_SIZE*8);
     uint8_t *bitmap = calloc(bm_blocks, LCFS_BLOCK_SIZE);
-    if (!bitmap) return -1;
-    // Marcar bloques 0 y 1 ocupados
-    bitmap[0] |= 0x03;
-    // Crear objeto free map
+    if (!bitmap) {
+        DEBUG_ERROR("No se pudo asignar memoria para bitmap de bloques libres");
+        return -1;
+    }
+    bitmap[0] |= 0x03; // bloques 0 y 1 ocupados
+
     lcfs_obj_header fm;
     memset(&fm, 0, sizeof(fm));
     memcpy(fm.magic, LCFS_MAGIC, LCFS_MAGIC_LEN);
@@ -124,19 +175,20 @@ int lcfs_init_superblock(int fd, uint64_t total_blocks) {
     fm.num_extents = bm_blocks;
     fm.header_crc = 0;
     fm.header_crc = header_crc(&fm);
-    if (lcfs_write_block(fd, 1, &fm) < 0) {
+    if (lcfs_write_header(fd, 1, &fm) < 0) {
+        DEBUG_ERROR("No se pudo escribir encabezado del free map en bloque 1");
         free(bitmap);
         return -1;
     }
     for (uint64_t i = 0; i < bm_blocks; i++) {
         if (lcfs_write_block(fd, 2 + i, bitmap + i*LCFS_BLOCK_SIZE) < 0) {
+            DEBUG_ERROR("No se pudo escribir bloque de datos del free map %llu", i);
             free(bitmap);
             return -1;
         }
     }
-    free(bitmap);
 
-    // Crear OID map (vacío por ahora) en bloque 2+bm_blocks
+    // OID map en bloque 2+bm_blocks
     uint64_t oid_map_block = 2 + bm_blocks;
     lcfs_obj_header om;
     memset(&om, 0, sizeof(om));
@@ -148,57 +200,96 @@ int lcfs_init_superblock(int fd, uint64_t total_blocks) {
     om.num_extents = 0;
     om.header_crc = 0;
     om.header_crc = header_crc(&om);
-    if (lcfs_write_block(fd, oid_map_block, &om) < 0) return -1;
+    if (lcfs_write_header(fd, oid_map_block, &om) < 0) {
+        DEBUG_ERROR("No se pudo escribir encabezado del OID map en bloque %llu", oid_map_block);
+        free(bitmap);
+        return -1;
+    }
+
     // Marcar oid_map_block ocupado en bitmap
     uint64_t byte_idx = oid_map_block / 8;
     uint8_t bit = 1 << (oid_map_block % 8);
     bitmap[byte_idx] |= bit;
-    if (lcfs_set_free_map(fd, bitmap, bm_blocks) < 0) return -1;
 
-    // Crear root en el siguiente bloque libre
+    if (lcfs_set_free_map(fd, bitmap, bm_blocks) < 0) {
+        DEBUG_ERROR("No se pudo actualizar free map con oid_map_block");
+        free(bitmap);
+        return -1;
+    }
+    free(bitmap);
+
+    // Crear root
     uint64_t root_blk;
-    if (lcfs_alloc_block(fd, &root_blk) < 0) return -1;
     lcfs_oid_t root_oid;
-    if (lcfs_create_object(fd, OBJ_TYPE_DIR, 0, "/", &root_oid, &root_blk) < 0) return -1;
-    // Ajustar OID del root a 3
+    if (lcfs_create_object(fd, OBJ_TYPE_DIR, 0, "/", &root_oid, &root_blk) < 0) {
+        DEBUG_ERROR("No se pudo crear el directorio raíz");
+        return -1;
+    }
+    DEBUG_PRINT("Root creado con OID %llu en bloque %llu", root_oid, root_blk);
+
     lcfs_obj_header hdr;
-    lcfs_read_header(fd, root_blk, &hdr);
+    if (lcfs_read_header(fd, root_blk, &hdr) < 0) {
+        DEBUG_ERROR("No se pudo leer el encabezado del root recién creado");
+        return -1;
+    }
     hdr.oid = LCFS_ROOT_OID;
     hdr.header_crc = 0;
     hdr.header_crc = header_crc(&hdr);
-    lcfs_write_header(fd, root_blk, &hdr);
+    if (lcfs_write_header(fd, root_blk, &hdr) < 0) {
+        DEBUG_ERROR("No se pudo actualizar el OID del root a 3");
+        return -1;
+    }
 
-    // Actualizar superblock con root oid y next_oid
-    lcfs_read_header(fd, 0, &sb);
-    sb.size = total_blocks;
+    // Actualizar superbloque
+    if (lcfs_read_header(fd, 0, &sb) < 0) {
+        DEBUG_ERROR("No se pudo leer superbloque para actualizar root_oid");
+        return -1;
+    }
     sb.first_child_oid = LCFS_ROOT_OID;
-    sb.generation = 4; // next_oid
+    sb.generation = 4;
     sb.header_crc = 0;
     sb.header_crc = header_crc(&sb);
-    lcfs_write_block(fd, 0, &sb);
+    if (lcfs_write_header(fd, 0, &sb) < 0) {
+        DEBUG_ERROR("No se pudo actualizar superbloque final");
+        return -1;
+    }
 
+    DEBUG_EXIT(0);
     return 0;
 }
 
 int lcfs_get_free_map(int fd, uint8_t **bitmap, uint64_t *bitmap_blocks) {
+    DEBUG_ENTER();
     lcfs_obj_header hdr;
-    if (lcfs_read_header(fd, LCFS_FREE_MAP_OID, &hdr) < 0) return -1;
-    if (hdr.type != OBJ_TYPE_FREE_MAP) return -1;
+    if (lcfs_read_header(fd, LCFS_FREE_MAP_OID, &hdr) < 0) {
+        DEBUG_ERROR("No se pudo leer encabezado del free map (OID 1)");
+        return -1;
+    }
+    if (hdr.type != OBJ_TYPE_FREE_MAP) {
+        DEBUG_ERROR("El OID 1 no es un free map");
+        return -1;
+    }
     uint64_t bm_blocks = hdr.num_extents;
     uint8_t *bm = malloc(bm_blocks * LCFS_BLOCK_SIZE);
-    if (!bm) return -1;
+    if (!bm) {
+        DEBUG_ERROR("No se pudo asignar memoria para free map");
+        return -1;
+    }
     for (uint64_t i = 0; i < bm_blocks; i++) {
-        if (lcfs_read_block(fd, 1 + i, bm + i*LCFS_BLOCK_SIZE) < 0) {
+        if (lcfs_read_block(fd, 2 + i, bm + i*LCFS_BLOCK_SIZE) < 0) {
+            DEBUG_ERROR("No se pudo leer bloque %llu del free map", i);
             free(bm);
             return -1;
         }
     }
     *bitmap = bm;
     *bitmap_blocks = bm_blocks;
+    DEBUG_EXIT(0);
     return 0;
 }
 
 int lcfs_set_free_map(int fd, const uint8_t *bitmap, uint64_t bitmap_blocks) {
+    DEBUG_ENTER();
     lcfs_obj_header hdr;
     if (lcfs_read_header(fd, LCFS_FREE_MAP_OID, &hdr) < 0) return -1;
     hdr.size = bitmap_blocks * LCFS_BLOCK_SIZE;
@@ -207,12 +298,14 @@ int lcfs_set_free_map(int fd, const uint8_t *bitmap, uint64_t bitmap_blocks) {
     hdr.header_crc = header_crc(&hdr);
     if (lcfs_write_header(fd, LCFS_FREE_MAP_OID, &hdr) < 0) return -1;
     for (uint64_t i = 0; i < bitmap_blocks; i++) {
-        if (lcfs_write_block(fd, 1 + i, bitmap + i*LCFS_BLOCK_SIZE) < 0) return -1;
+        if (lcfs_write_block(fd, 2 + i, bitmap + i*LCFS_BLOCK_SIZE) < 0) return -1;
     }
+    DEBUG_EXIT(0);
     return 0;
 }
 
 int lcfs_alloc_block(int fd, uint64_t *block_num) {
+    DEBUG_ENTER();
     uint8_t *bitmap;
     uint64_t bm_blocks;
     if (lcfs_get_free_map(fd, &bitmap, &bm_blocks) < 0) return -1;
@@ -228,15 +321,20 @@ int lcfs_alloc_block(int fd, uint64_t *block_num) {
             }
             free(bitmap);
             *block_num = i;
+            DEBUG_PRINT("Bloque %llu asignado", i);
+            DEBUG_EXIT(0);
             return 0;
         }
     }
     free(bitmap);
+    DEBUG_ERROR("No hay bloques libres");
     errno = ENOSPC;
     return -1;
 }
 
 int lcfs_free_block(int fd, uint64_t block_num) {
+    DEBUG_ENTER();
+    DEBUG_PRINT("Liberando bloque %llu", block_num);
     uint8_t *bitmap;
     uint64_t bm_blocks;
     if (lcfs_get_free_map(fd, &bitmap, &bm_blocks) < 0) return -1;
@@ -248,64 +346,136 @@ int lcfs_free_block(int fd, uint64_t block_num) {
         return -1;
     }
     free(bitmap);
+    DEBUG_EXIT(0);
     return 0;
 }
 
-int lcfs_object_location(int fd, lcfs_oid_t oid, uint64_t *block_num) {
-    // Buscar en el OID map (objeto con OID=2)
+int lcfs_oid_map_add(int fd, lcfs_oid_t oid, uint64_t block) {
+    DEBUG_ENTER();
+    DEBUG_PRINT("Añadiendo OID %llu -> bloque %llu al OID map", oid, block);
+    uint8_t map_block[LCFS_BLOCK_SIZE];
+    if (lcfs_read_block(fd, LCFS_OID_MAP_OID, map_block) < 0) return -1;
     lcfs_obj_header hdr;
-    if (lcfs_read_header(fd, LCFS_OID_MAP_OID, &hdr) == 0 && hdr.type == OBJ_TYPE_OID_MAP) {
-        // El OID map almacena pares (oid, block) en su espacio de datos
-        uint8_t block[LCFS_BLOCK_SIZE];
-        if (lcfs_read_block(fd, LCFS_OID_MAP_OID, block) == 0) {
-            // Recorrer entradas (simplificado: asumimos array de pares)
-            uint64_t count = hdr.size / sizeof(uint64_t) / 2;
-            uint64_t *entries = (uint64_t*)(block + LCFS_HEADER_SIZE);
+    memcpy(&hdr, map_block, sizeof(hdr));
+    if (memcmp(hdr.magic, LCFS_MAGIC, LCFS_MAGIC_LEN) != 0 || hdr.type != OBJ_TYPE_OID_MAP) {
+        DEBUG_ERROR("El bloque del OID map no es válido");
+        return -1;
+    }
+    uint64_t count = hdr.size / 16;
+    if (count >= (LCFS_BLOCK_SIZE - LCFS_HEADER_SIZE) / 16) {
+        DEBUG_ERROR("OID map lleno");
+        errno = ENOSPC;
+        return -1;
+    }
+    uint64_t *entries = (uint64_t*)(map_block + LCFS_HEADER_SIZE);
+    entries[2*count] = oid;
+    entries[2*count+1] = block;
+    hdr.size += 16;
+    hdr.header_crc = 0;
+    hdr.header_crc = header_crc(&hdr);
+    memcpy(map_block, &hdr, sizeof(hdr));
+    if (lcfs_write_block(fd, LCFS_OID_MAP_OID, map_block) < 0) return -1;
+    DEBUG_EXIT(0);
+    return 0;
+}
+
+int lcfs_oid_map_remove(int fd, lcfs_oid_t oid) {
+    DEBUG_ENTER();
+    DEBUG_PRINT("Eliminando OID %llu del OID map", oid);
+    uint8_t map_block[LCFS_BLOCK_SIZE];
+    if (lcfs_read_block(fd, LCFS_OID_MAP_OID, map_block) < 0) return -1;
+    lcfs_obj_header hdr;
+    memcpy(&hdr, map_block, sizeof(hdr));
+    if (hdr.type != OBJ_TYPE_OID_MAP) return -1;
+    uint64_t count = hdr.size / 16;
+    uint64_t *entries = (uint64_t*)(map_block + LCFS_HEADER_SIZE);
+    for (uint64_t i = 0; i < count; i++) {
+        if (entries[2*i] == oid) {
+            if (i != count-1) {
+                entries[2*i] = entries[2*(count-1)];
+                entries[2*i+1] = entries[2*(count-1)+1];
+            }
+            hdr.size -= 16;
+            hdr.header_crc = 0;
+            hdr.header_crc = header_crc(&hdr);
+            memcpy(map_block, &hdr, sizeof(hdr));
+            if (lcfs_write_block(fd, LCFS_OID_MAP_OID, map_block) < 0) return -1;
+            DEBUG_EXIT(0);
+            return 0;
+        }
+    }
+    DEBUG_ERROR("OID %llu no encontrado en OID map", oid);
+    errno = ENOENT;
+    return -1;
+}
+
+int lcfs_object_location(int fd, lcfs_oid_t oid, uint64_t *block_num) {
+    DEBUG_ENTER();
+    DEBUG_PRINT("Buscando ubicación del OID %llu", oid);
+    uint8_t map_block[LCFS_BLOCK_SIZE];
+    if (lcfs_read_block(fd, LCFS_OID_MAP_OID, map_block) == 0) {
+        lcfs_obj_header hdr;
+        memcpy(&hdr, map_block, sizeof(hdr));
+        if (hdr.type == OBJ_TYPE_OID_MAP) {
+            uint64_t count = hdr.size / 16;
+            uint64_t *entries = (uint64_t*)(map_block + LCFS_HEADER_SIZE);
             for (uint64_t i = 0; i < count; i++) {
                 if (entries[2*i] == oid) {
                     *block_num = entries[2*i+1];
+                    DEBUG_PRINT("Encontrado en OID map: bloque %llu", *block_num);
+                    DEBUG_EXIT(0);
                     return 0;
                 }
             }
         }
     }
-    // Fallback: escaneo completo
-    // Obtener tamaño del dispositivo
+    DEBUG_PRINT("No encontrado en OID map, escaneando disco...");
     off_t dev_size = lseek(fd, 0, SEEK_END);
     uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
     for (uint64_t b = 0; b < total_blocks; b++) {
         lcfs_obj_header obj_hdr;
         if (lcfs_read_header(fd, b, &obj_hdr) == 0 && obj_hdr.oid == oid) {
             *block_num = b;
+            DEBUG_PRINT("Encontrado por escaneo: bloque %llu", b);
+            DEBUG_EXIT(0);
             return 0;
         }
     }
+    DEBUG_ERROR("OID %llu no encontrado en el disco", oid);
     errno = ENOENT;
     return -1;
 }
 
 int lcfs_create_object(int fd, uint16_t type, lcfs_oid_t parent_oid,
                        const char *name, lcfs_oid_t *new_oid, uint64_t *block_num) {
+    DEBUG_ENTER();
+    DEBUG_PRINT("Creando objeto tipo %u con nombre '%s', padre OID %llu",
+                type, name, parent_oid);
     uint64_t blk;
-    if (lcfs_alloc_block(fd, &blk) < 0) return -1;
+    if (lcfs_alloc_block(fd, &blk) < 0) {
+        DEBUG_ERROR("No se pudo asignar bloque para el nuevo objeto");
+        return -1;
+    }
     lcfs_obj_header hdr;
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.magic, LCFS_MAGIC, LCFS_MAGIC_LEN);
     hdr.type = type;
     hdr.version = LCFS_VERSION;
     hdr.parent_oid = parent_oid;
-    // OID: generarlo a partir del superbloque
+    // Generar OID desde superblock
     lcfs_obj_header sb;
     if (lcfs_read_header(fd, LCFS_SUPERBLOCK_OID, &sb) == 0) {
         hdr.oid = sb.generation++;
         sb.header_crc = 0;
         sb.header_crc = header_crc(&sb);
-        lcfs_write_block(fd, LCFS_SUPERBLOCK_OID, &sb);
+        if (lcfs_write_header(fd, LCFS_SUPERBLOCK_OID, &sb) < 0) {
+            DEBUG_ERROR("No se pudo actualizar el superbloque con el nuevo OID");
+            lcfs_free_block(fd, blk);
+            return -1;
+        }
     } else {
-        // Si no hay superbloque, usar timestamp+aleatorio simple
         hdr.oid = (uint64_t)time(NULL) << 32 | (uint64_t)rand();
     }
-    // Nombre
     uint8_t block[LCFS_BLOCK_SIZE] = {0};
     size_t name_len = strlen(name);
     if (name_len > LCFS_MAX_NAME_LEN) name_len = LCFS_MAX_NAME_LEN;
@@ -315,43 +485,53 @@ int lcfs_create_object(int fd, uint16_t type, lcfs_oid_t parent_oid,
     hdr.header_crc = header_crc(&hdr);
     memcpy(block, &hdr, sizeof(hdr));
     if (lcfs_write_block(fd, blk, block) < 0) {
+        DEBUG_ERROR("No se pudo escribir el objeto en el bloque %llu", blk);
         lcfs_free_block(fd, blk);
         return -1;
     }
-    // Actualizar OID map
-    // (simplificado: no implementado aquí, se hará en lcfs_rebuild_oid_map)
+    if (lcfs_oid_map_add(fd, hdr.oid, blk) < 0) {
+        DEBUG_ERROR("No se pudo añadir el OID %llu al OID map", hdr.oid);
+        lcfs_free_block(fd, blk);
+        return -1;
+    }
     if (new_oid) *new_oid = hdr.oid;
     if (block_num) *block_num = blk;
+    DEBUG_PRINT("Objeto creado con OID %llu en bloque %llu", hdr.oid, blk);
+    DEBUG_EXIT(0);
     return 0;
                        }
 
                        int lcfs_delete_object(int fd, lcfs_oid_t oid) {
+                           DEBUG_ENTER();
+                           DEBUG_PRINT("Eliminando objeto con OID %llu", oid);
                            uint64_t block;
                            if (lcfs_object_location(fd, oid, &block) < 0) return -1;
                            lcfs_obj_header hdr;
                            if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
-                           // Liberar extents si es archivo o symlink con datos externos
-                           if (hdr.type == OBJ_TYPE_FILE || hdr.type == OBJ_TYPE_SYMLINK) {
-                               if (hdr.num_extents > 0) {
-                                   // Leer extents almacenados en el bloque o en tabla aparte
-                                   // Por simplicidad asumimos que los extents están en el mismo bloque
-                                   if (hdr.num_extents * sizeof(lcfs_extent) <= LCFS_BLOCK_SIZE - LCFS_HEADER_SIZE - 2 - LCFS_MAX_NAME_LEN) {
-                                       lcfs_extent *extents = (lcfs_extent*)((uint8_t*)&hdr + LCFS_HEADER_SIZE + 2 + strlen((char*)((uint8_t*)&hdr + LCFS_HEADER_SIZE + 2)));
-                                       for (uint32_t i = 0; i < hdr.num_extents; i++) {
-                                           lcfs_free_block(fd, extents[i].physical_block);
-                                       }
-                                   } else {
-                                       // Tabla de extents separada (no implementado en esta versión simple)
+                           if ((hdr.type == OBJ_TYPE_FILE || hdr.type == OBJ_TYPE_SYMLINK) && hdr.num_extents > 0) {
+                               uint8_t obj_block[LCFS_BLOCK_SIZE];
+                               if (lcfs_read_block(fd, block, obj_block) == 0) {
+                                   uint16_t name_len;
+                                   memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                   size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                   lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
+                                   uint64_t phys_start = extents[0].physical_block;
+                                   uint64_t num_blocks = (hdr.size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+                                   for (uint64_t i = 0; i < num_blocks; i++) {
+                                       if (lcfs_free_block(fd, phys_start + i) < 0) return -1;
                                    }
                                }
                            }
-                           lcfs_free_block(fd, block);
-                           // TODO: eliminar entrada del directorio padre
+                           if (lcfs_free_block(fd, block) < 0) return -1;
+                           if (lcfs_oid_map_remove(fd, oid) < 0) return -1;
+                           DEBUG_EXIT(0);
                            return 0;
                        }
 
                        int lcfs_lookup_name(int fd, lcfs_oid_t dir_oid, const char *name,
                                             lcfs_oid_t *child_oid, uint16_t *child_type) {
+                           DEBUG_ENTER();
+                           DEBUG_PRINT("Buscando '%s' en directorio OID %llu", name, dir_oid);
                            uint64_t dir_block;
                            if (lcfs_object_location(fd, dir_oid, &dir_block) < 0) return -1;
                            lcfs_obj_header hdr;
@@ -374,15 +554,21 @@ int lcfs_create_object(int fd, uint16_t type, lcfs_oid_t parent_oid,
                                if (strcmp(entry_name, name) == 0) {
                                    if (child_oid) *child_oid = entry.child_oid;
                                    if (child_type) *child_type = entry.child_type;
+                                   DEBUG_PRINT("Encontrado: OID %llu, tipo %u", entry.child_oid, entry.child_type);
+                                   DEBUG_EXIT(0);
                                    return 0;
                                }
                            }
+                           DEBUG_ERROR("Nombre '%s' no encontrado en directorio OID %llu", name, dir_oid);
                            errno = ENOENT;
                            return -1;
                                             }
 
                                             int lcfs_add_dir_entry(int fd, lcfs_oid_t dir_oid, lcfs_oid_t child_oid,
                                                                    uint16_t child_type, const char *name) {
+                                                DEBUG_ENTER();
+                                                DEBUG_PRINT("Añadiendo entrada '%s' -> OID %llu al directorio %llu",
+                                                            name, child_oid, dir_oid);
                                                 uint64_t dir_block;
                                                 if (lcfs_object_location(fd, dir_oid, &dir_block) < 0) return -1;
                                                 lcfs_obj_header hdr;
@@ -408,68 +594,296 @@ int lcfs_create_object(int fd, uint16_t type, lcfs_oid_t parent_oid,
                                                         hdr.header_crc = header_crc(&hdr);
                                                         memcpy(block, &hdr, sizeof(hdr));
                                                         if (lcfs_write_block(fd, dir_block, block) < 0) return -1;
+                                                        DEBUG_EXIT(0);
                                                         return 0;
                                                     }
                                                     pos += sizeof(entry) + entry.name_len;
                                                 }
+                                                DEBUG_ERROR("No hay espacio en directorio %llu para nueva entrada", dir_oid);
                                                 errno = ENOSPC;
                                                 return -1;
                                                                    }
 
+                                                                   int lcfs_remove_dir_entry(int fd, lcfs_oid_t dir_oid, const char *name) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Eliminando entrada '%s' del directorio %llu", name, dir_oid);
+                                                                       uint64_t dir_block;
+                                                                       if (lcfs_object_location(fd, dir_oid, &dir_block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, dir_block, &hdr) < 0) return -1;
+                                                                       if (hdr.type != OBJ_TYPE_DIR) return -1;
+                                                                       uint8_t block[LCFS_BLOCK_SIZE];
+                                                                       if (lcfs_read_block(fd, dir_block, block) < 0) return -1;
+                                                                       uint16_t dname_len;
+                                                                       memcpy(&dname_len, block + LCFS_HEADER_SIZE, 2);
+                                                                       size_t pos = LCFS_HEADER_SIZE + 2 + dname_len;
+                                                                       int found = 0;
+                                                                       while (pos + sizeof(lcfs_dir_entry) <= LCFS_BLOCK_SIZE) {
+                                                                           lcfs_dir_entry entry;
+                                                                           memcpy(&entry, block + pos, sizeof(entry));
+                                                                           if (entry.child_oid == 0) break;
+                                                                           size_t entry_size = sizeof(entry) + entry.name_len;
+                                                                           char entry_name[LCFS_MAX_NAME_LEN+1];
+                                                                           memcpy(entry_name, block + pos + sizeof(entry), entry.name_len);
+                                                                           entry_name[entry.name_len] = '\0';
+                                                                           if (strcmp(entry_name, name) == 0) {
+                                                                               size_t next_pos = pos + entry_size;
+                                                                               size_t remaining = LCFS_BLOCK_SIZE - next_pos;
+                                                                               memmove(block + pos, block + next_pos, remaining);
+                                                                               memset(block + pos + remaining, 0, entry_size);
+                                                                               hdr.size--;
+                                                                               hdr.header_crc = 0;
+                                                                               hdr.header_crc = header_crc(&hdr);
+                                                                               memcpy(block, &hdr, sizeof(hdr));
+                                                                               if (lcfs_write_block(fd, dir_block, block) < 0) return -1;
+                                                                               found = 1;
+                                                                               break;
+                                                                           }
+                                                                           pos += entry_size;
+                                                                       }
+                                                                       if (!found) {
+                                                                           DEBUG_ERROR("Entrada '%s' no encontrada para eliminar", name);
+                                                                           errno = ENOENT;
+                                                                           return -1;
+                                                                       }
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
+                                                                   }
+
                                                                    int lcfs_read_file(int fd, lcfs_oid_t oid, char *buf, size_t size, off_t offset) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Leyendo archivo OID %llu, size %zu, offset %ld", oid, size, offset);
                                                                        uint64_t block;
                                                                        if (lcfs_object_location(fd, oid, &block) < 0) return -1;
                                                                        lcfs_obj_header hdr;
                                                                        if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
                                                                        if (hdr.type != OBJ_TYPE_FILE && hdr.type != OBJ_TYPE_SYMLINK) return -1;
-                                                                       // Archivo inline
                                                                        if (hdr.num_extents == 0) {
                                                                            uint8_t obj_block[LCFS_BLOCK_SIZE];
                                                                            if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
                                                                            uint16_t name_len;
                                                                            memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
                                                                            size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
-                                                                           if (offset >= hdr.size) return 0;
+                                                                           if (offset >= (off_t)hdr.size) return 0;
                                                                            size_t read_size = size;
-                                                                           if (offset + read_size > hdr.size) read_size = hdr.size - offset;
+                                                                           if ((off_t)(offset + read_size) > hdr.size) read_size = hdr.size - offset;
+                                                                           if (data_start + offset + read_size > LCFS_BLOCK_SIZE) read_size = LCFS_BLOCK_SIZE - data_start - offset;
                                                                            memcpy(buf, obj_block + data_start + offset, read_size);
+                                                                           DEBUG_PRINT("Lectura inline: %zu bytes", read_size);
                                                                            return read_size;
+                                                                       } else {
+                                                                           uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                           if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                           uint16_t name_len;
+                                                                           memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                           size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                                                           lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
+                                                                           uint64_t phys_start = extents[0].physical_block;
+                                                                           size_t total_read = 0;
+                                                                           off_t cur_off = offset;
+                                                                           while (total_read < size && cur_off < (off_t)hdr.size) {
+                                                                               uint64_t block_idx = cur_off / LCFS_BLOCK_SIZE;
+                                                                               uint64_t off_in_block = cur_off % LCFS_BLOCK_SIZE;
+                                                                               uint64_t phys_block = phys_start + block_idx;
+                                                                               uint8_t data[LCFS_BLOCK_SIZE];
+                                                                               if (lcfs_read_block(fd, phys_block, data) < 0) return -1;
+                                                                               size_t len = LCFS_BLOCK_SIZE - off_in_block;
+                                                                               if ((off_t)(cur_off + len) > hdr.size) len = hdr.size - cur_off;
+                                                                               if (len > size - total_read) len = size - total_read;
+                                                                               memcpy(buf + total_read, data + off_in_block, len);
+                                                                               total_read += len;
+                                                                               cur_off += len;
+                                                                           }
+                                                                           DEBUG_PRINT("Lectura extent: %zu bytes", total_read);
+                                                                           return total_read;
                                                                        }
-                                                                       // Archivo con extents (simplificado: asumimos extents en el mismo bloque)
-                                                                       uint8_t obj_block[LCFS_BLOCK_SIZE];
-                                                                       if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
-                                                                       uint16_t name_len;
-                                                                       memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
-                                                                       size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
-                                                                       lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
-                                                                       size_t total_read = 0;
-                                                                       off_t current_offset = 0;
-                                                                       for (uint32_t i = 0; i < hdr.num_extents; i++) {
-                                                                           uint64_t logical_start = extents[i].logical_block * LCFS_BLOCK_SIZE;
-                                                                           uint64_t logical_end = logical_start + LCFS_BLOCK_SIZE;
-                                                                           if (offset >= logical_end || offset + size <= logical_start) continue;
-                                                                           uint64_t phys_block = extents[i].physical_block;
-                                                                           uint8_t data[LCFS_BLOCK_SIZE];
-                                                                           if (lcfs_read_block(fd, phys_block, data) < 0) return -1;
-                                                                           off_t off_in_extent = offset - logical_start;
-                                                                           size_t len = LCFS_BLOCK_SIZE - off_in_extent;
-                                                                           if (offset + len > hdr.size) len = hdr.size - offset;
-                                                                           if (len > size - total_read) len = size - total_read;
-                                                                           memcpy(buf + total_read, data + off_in_extent, len);
-                                                                           total_read += len;
-                                                                           offset += len;
-                                                                           if (total_read >= size) break;
+                                                                   }
+
+                                                                   int lcfs_write_file(int fd, lcfs_oid_t oid, const char *buf, size_t size, off_t offset) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Escribiendo archivo OID %llu, size %zu, offset %ld", oid, size, offset);
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       if (hdr.type != OBJ_TYPE_FILE) return -1;
+
+                                                                       if (hdr.num_extents == 0) {
+                                                                           uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                           if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                           uint16_t name_len;
+                                                                           memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                           size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                                                           uint64_t max_inline = LCFS_BLOCK_SIZE - data_start;
+                                                                           if ((uint64_t)offset + size > max_inline) {
+                                                                               DEBUG_ERROR("No cabe en inline (máx %llu bytes)", max_inline);
+                                                                               errno = ENOSPC;
+                                                                               return -1;
+                                                                           }
+                                                                           if ((off_t)(offset + size) > hdr.size) {
+                                                                               hdr.size = offset + size;
+                                                                           }
+                                                                           memcpy(obj_block + data_start + offset, buf, size);
+                                                                           hdr.header_crc = 0;
+                                                                           hdr.header_crc = header_crc(&hdr);
+                                                                           memcpy(obj_block, &hdr, sizeof(hdr));
+                                                                           if (lcfs_write_block(fd, block, obj_block) < 0) return -1;
+                                                                           DEBUG_PRINT("Escritura inline: %zu bytes", size);
+                                                                           return size;
+                                                                       } else {
+                                                                           uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                           if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                           uint16_t name_len;
+                                                                           memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                           size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                                                           lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
+                                                                           uint64_t phys_start = extents[0].physical_block;
+                                                                           if ((off_t)(offset + size) > hdr.size) {
+                                                                               DEBUG_ERROR("Intento de escribir más allá del tamaño actual");
+                                                                               errno = ENOSPC;
+                                                                               return -1;
+                                                                           }
+                                                                           off_t cur_off = offset;
+                                                                           size_t total_written = 0;
+                                                                           while (total_written < size) {
+                                                                               uint64_t block_idx = cur_off / LCFS_BLOCK_SIZE;
+                                                                               uint64_t off_in_block = cur_off % LCFS_BLOCK_SIZE;
+                                                                               uint64_t phys_block = phys_start + block_idx;
+                                                                               uint8_t data[LCFS_BLOCK_SIZE];
+                                                                               if (lcfs_read_block(fd, phys_block, data) < 0) return -1;
+                                                                               size_t len = LCFS_BLOCK_SIZE - off_in_block;
+                                                                               if ((off_t)(cur_off + len) > hdr.size) len = hdr.size - cur_off;
+                                                                               if (len > size - total_written) len = size - total_written;
+                                                                               memcpy(data + off_in_block, buf + total_written, len);
+                                                                               if (lcfs_write_block(fd, phys_block, data) < 0) return -1;
+                                                                               total_written += len;
+                                                                               cur_off += len;
+                                                                           }
+                                                                           DEBUG_PRINT("Escritura extent: %zu bytes", total_written);
+                                                                           return total_written;
                                                                        }
-                                                                       return total_read;
+                                                                   }
+
+                                                                   int lcfs_truncate_file(int fd, lcfs_oid_t oid, off_t new_size) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Truncando archivo OID %llu a %ld bytes", oid, new_size);
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       if (hdr.type != OBJ_TYPE_FILE) return -1;
+
+                                                                       if (new_size < 0) new_size = 0;
+                                                                       size_t max_inline = LCFS_BLOCK_SIZE - LCFS_HEADER_SIZE - 2 - LCFS_MAX_NAME_LEN;
+                                                                       if ((size_t)new_size <= max_inline) {
+                                                                           if (hdr.num_extents > 0) {
+                                                                               uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                               if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                               uint16_t name_len;
+                                                                               memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                               size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                                                               lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
+                                                                               uint64_t phys_start = extents[0].physical_block;
+                                                                               uint64_t num_blocks = (hdr.size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+                                                                               for (uint64_t i = 0; i < num_blocks; i++) {
+                                                                                   if (lcfs_free_block(fd, phys_start + i) < 0) return -1;
+                                                                               }
+                                                                               hdr.num_extents = 0;
+                                                                           }
+                                                                           hdr.size = new_size;
+                                                                           hdr.header_crc = 0;
+                                                                           hdr.header_crc = header_crc(&hdr);
+                                                                           if (lcfs_write_header(fd, block, &hdr) < 0) return -1;
+                                                                           DEBUG_EXIT(0);
+                                                                           return 0;
+                                                                       } else {
+                                                                           if (hdr.num_extents == 0) {
+                                                                               uint64_t num_blocks = (new_size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+                                                                               uint64_t start_block;
+                                                                               int found = 0;
+                                                                               for (uint64_t b = 0; b < (uint64_t)lseek(fd,0,SEEK_END)/LCFS_BLOCK_SIZE; b++) {
+                                                                                   int ok = 1;
+                                                                                   for (uint64_t i = 0; i < num_blocks; i++) {
+                                                                                       uint8_t *bm; uint64_t bm_blocks;
+                                                                                       if (lcfs_get_free_map(fd, &bm, &bm_blocks) < 0) return -1;
+                                                                                       uint64_t byte_idx = (b+i)/8;
+                                                                                       uint8_t bit = 1 << ((b+i)%8);
+                                                                                       if (bm[byte_idx] & bit) { ok = 0; free(bm); break; }
+                                                                                       free(bm);
+                                                                                   }
+                                                                                   if (ok) { start_block = b; found = 1; break; }
+                                                                               }
+                                                                               if (!found) {
+                                                                                   DEBUG_ERROR("No se encontró secuencia contigua de %llu bloques", num_blocks);
+                                                                                   errno = ENOSPC;
+                                                                                   return -1;
+                                                                               }
+                                                                               for (uint64_t i = 0; i < num_blocks; i++) {
+                                                                                   uint64_t blk = start_block + i;
+                                                                                   uint8_t *bm; uint64_t bm_blocks;
+                                                                                   if (lcfs_get_free_map(fd, &bm, &bm_blocks) < 0) return -1;
+                                                                                   uint64_t byte_idx = blk/8;
+                                                                                   uint8_t bit = 1 << (blk%8);
+                                                                                   bm[byte_idx] |= bit;
+                                                                                   if (lcfs_set_free_map(fd, bm, bm_blocks) < 0) { free(bm); return -1; }
+                                                                                   free(bm);
+                                                                               }
+                                                                               hdr.num_extents = 1;
+                                                                               hdr.size = new_size;
+                                                                               uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                               if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                               uint16_t name_len;
+                                                                               memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                               size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                                                               lcfs_extent ext;
+                                                                               ext.logical_block = 0;
+                                                                               ext.physical_block = start_block;
+                                                                               memcpy(obj_block + data_start, &ext, sizeof(ext));
+                                                                               hdr.header_crc = 0;
+                                                                               hdr.header_crc = header_crc(&hdr);
+                                                                               memcpy(obj_block, &hdr, sizeof(hdr));
+                                                                               if (lcfs_write_block(fd, block, obj_block) < 0) return -1;
+                                                                               DEBUG_EXIT(0);
+                                                                               return 0;
+                                                                           } else {
+                                                                               uint64_t current_blocks = (hdr.size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+                                                                               uint64_t needed_blocks = (new_size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+                                                                               if (needed_blocks > current_blocks) {
+                                                                                   DEBUG_ERROR("No se puede expandir extent contiguo");
+                                                                                   errno = ENOSPC;
+                                                                                   return -1;
+                                                                               } else {
+                                                                                   hdr.size = new_size;
+                                                                                   hdr.header_crc = 0;
+                                                                                   hdr.header_crc = header_crc(&hdr);
+                                                                                   if (lcfs_write_header(fd, block, &hdr) < 0) return -1;
+                                                                                   DEBUG_EXIT(0);
+                                                                                   return 0;
+                                                                               }
+                                                                           }
+                                                                       }
+                                                                   }
+
+                                                                   int lcfs_get_object_size(int fd, lcfs_oid_t oid, uint32_t *size) {
+                                                                       DEBUG_ENTER();
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       *size = hdr.size;
+                                                                       DEBUG_PRINT("Tamaño del objeto OID %llu: %u", oid, *size);
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
                                                                    }
 
                                                                    int lcfs_readlink(int fd, lcfs_oid_t oid, char *buf, size_t bufsize) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Leyendo symlink OID %llu", oid);
                                                                        uint64_t block;
                                                                        if (lcfs_object_location(fd, oid, &block) < 0) return -1;
                                                                        lcfs_obj_header hdr;
                                                                        if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
                                                                        if (hdr.type != OBJ_TYPE_SYMLINK) return -1;
-                                                                       // Los symlinks son como archivos inline
                                                                        if (hdr.num_extents == 0) {
                                                                            uint8_t obj_block[LCFS_BLOCK_SIZE];
                                                                            if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
@@ -480,95 +894,115 @@ int lcfs_create_object(int fd, uint16_t type, lcfs_oid_t parent_oid,
                                                                            if (link_len >= bufsize) link_len = bufsize - 1;
                                                                            memcpy(buf, obj_block + data_start, link_len);
                                                                            buf[link_len] = '\0';
-                                                                           return 0;
                                                                        } else {
-                                                                           // Symlink con extents (raro, pero posible si es muy largo)
                                                                            char *tmp = malloc(hdr.size + 1);
                                                                            if (!tmp) return -1;
                                                                            lcfs_read_file(fd, oid, tmp, hdr.size, 0);
                                                                            tmp[hdr.size] = '\0';
                                                                            strncpy(buf, tmp, bufsize);
                                                                            free(tmp);
-                                                                           return 0;
                                                                        }
+                                                                       DEBUG_PRINT("Target del symlink: '%s'", buf);
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
                                                                    }
 
-                                                                   int lcfs_rebuild_free_map(int fd, uint8_t **bitmap, uint64_t *bitmap_blocks) {
-                                                                       off_t dev_size = lseek(fd, 0, SEEK_END);
-                                                                       uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
-                                                                       uint64_t bm_blocks = (total_blocks + LCFS_BLOCK_SIZE*8 - 1) / (LCFS_BLOCK_SIZE*8);
-                                                                       uint8_t *bm = calloc(bm_blocks, LCFS_BLOCK_SIZE);
-                                                                       if (!bm) return -1;
-                                                                       // Marcar todos los bloques que contienen objetos válidos
-                                                                       for (uint64_t b = 0; b < total_blocks; b++) {
-                                                                           uint8_t block[LCFS_BLOCK_SIZE];
-                                                                           if (lcfs_read_block(fd, b, block) < 0) continue;
-                                                                           lcfs_obj_header hdr;
-                                                                           memcpy(&hdr, block, sizeof(hdr));
-                                                                           if (memcmp(hdr.magic, LCFS_MAGIC, LCFS_MAGIC_LEN) == 0 &&
-                                                                               hdr.header_crc == header_crc(&hdr)) {
-                                                                               // Es un objeto válido, marcar su bloque
-                                                                               uint64_t byte_idx = b / 8;
-                                                                           uint8_t bit = 1 << (b % 8);
-                                                                           bm[byte_idx] |= bit;
-                                                                           // Si es archivo con extents, marcar los bloques de datos
-                                                                           if (hdr.type == OBJ_TYPE_FILE || hdr.type == OBJ_TYPE_SYMLINK) {
-                                                                               if (hdr.num_extents > 0) {
-                                                                                   // Asumimos extents en el mismo bloque por simplicidad
-                                                                                   uint16_t name_len;
-                                                                                   memcpy(&name_len, block + LCFS_HEADER_SIZE, 2);
-                                                                                   size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
-                                                                                   lcfs_extent *extents = (lcfs_extent*)(block + data_start);
-                                                                                   for (uint32_t i = 0; i < hdr.num_extents; i++) {
-                                                                                       uint64_t phys = extents[i].physical_block;
-                                                                                       byte_idx = phys / 8;
-                                                                                       bit = 1 << (phys % 8);
-                                                                                       bm[byte_idx] |= bit;
+                                                                   int lcfs_create_dir(int fd, lcfs_oid_t parent_oid, const char *name, lcfs_oid_t *new_oid) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Creando directorio '%s' en padre OID %llu", name, parent_oid);
+                                                                       lcfs_oid_t oid;
+                                                                       if (lcfs_create_object(fd, OBJ_TYPE_DIR, parent_oid, name, &oid, NULL) < 0) return -1;
+                                                                       if (lcfs_add_dir_entry(fd, parent_oid, oid, OBJ_TYPE_DIR, name) < 0) {
+                                                                           lcfs_delete_object(fd, oid);
+                                                                           return -1;
+                                                                       }
+                                                                       if (new_oid) *new_oid = oid;
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
+                                                                   }
+
+                                                                   int lcfs_create_symlink(int fd, lcfs_oid_t parent_oid, const char *name, const char *target, lcfs_oid_t *new_oid) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Creando symlink '%s' -> '%s' en padre OID %llu", name, target, parent_oid);
+                                                                       lcfs_oid_t oid;
+                                                                       if (lcfs_create_object(fd, OBJ_TYPE_SYMLINK, parent_oid, name, &oid, NULL) < 0) return -1;
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                       if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                       uint16_t name_len;
+                                                                       memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                       size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                                                       size_t target_len = strlen(target);
+                                                                       if (target_len > LCFS_BLOCK_SIZE - data_start) {
+                                                                           DEBUG_ERROR("Target del symlink demasiado largo");
+                                                                           lcfs_delete_object(fd, oid);
+                                                                           errno = ENAMETOOLONG;
+                                                                           return -1;
+                                                                       }
+                                                                       memcpy(obj_block + data_start, target, target_len);
+                                                                       hdr.size = target_len;
+                                                                       hdr.header_crc = 0;
+                                                                       hdr.header_crc = header_crc(&hdr);
+                                                                       memcpy(obj_block, &hdr, sizeof(hdr));
+                                                                       if (lcfs_write_block(fd, block, obj_block) < 0) {
+                                                                           lcfs_delete_object(fd, oid);
+                                                                           return -1;
+                                                                       }
+                                                                       if (lcfs_add_dir_entry(fd, parent_oid, oid, OBJ_TYPE_SYMLINK, name) < 0) {
+                                                                           lcfs_delete_object(fd, oid);
+                                                                           return -1;
+                                                                       }
+                                                                       if (new_oid) *new_oid = oid;
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
+                                                                   }
+
+                                                                   int lcfs_rename(int fd, lcfs_oid_t old_parent, const char *old_name,
+                                                                                   lcfs_oid_t new_parent, const char *new_name) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Renombrando '%s' de padre %llu a '%s' en padre %llu",
+                                                                                   old_name, old_parent, new_name, new_parent);
+                                                                       lcfs_oid_t oid;
+                                                                       uint16_t type;
+                                                                       if (lcfs_lookup_name(fd, old_parent, old_name, &oid, &type) < 0) return -1;
+                                                                       lcfs_oid_t dummy;
+                                                                       if (lcfs_lookup_name(fd, new_parent, new_name, &dummy, &type) == 0) {
+                                                                           errno = EEXIST;
+                                                                           return -1;
+                                                                       }
+                                                                       if (lcfs_add_dir_entry(fd, new_parent, oid, type, new_name) < 0) return -1;
+                                                                       if (lcfs_remove_dir_entry(fd, old_parent, old_name) < 0) {
+                                                                           lcfs_remove_dir_entry(fd, new_parent, new_name);
+                                                                           return -1;
+                                                                       }
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       hdr.parent_oid = new_parent;
+                                                                       hdr.header_crc = 0;
+                                                                       hdr.header_crc = header_crc(&hdr);
+                                                                       if (lcfs_write_header(fd, block, &hdr) < 0) return -1;
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
                                                                                    }
-                                                                               }
-                                                                           }
-                                                                               }
-                                                                       }
-                                                                       *bitmap = bm;
-                                                                       *bitmap_blocks = bm_blocks;
-                                                                       return 0;
-                                                                   }
 
-                                                                   int lcfs_rebuild_oid_map(int fd) {
-                                                                       // Escanear todos los bloques y construir OID map
-                                                                       off_t dev_size = lseek(fd, 0, SEEK_END);
-                                                                       uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
-                                                                       // Crear lista temporal de pares (oid, block)
-                                                                       typedef struct { uint64_t oid, block; } oid_entry;
-                                                                       oid_entry *entries = malloc(sizeof(oid_entry) * total_blocks);
-                                                                       if (!entries) return -1;
-                                                                       uint64_t count = 0;
-                                                                       for (uint64_t b = 0; b < total_blocks; b++) {
-                                                                           lcfs_obj_header hdr;
-                                                                           if (lcfs_read_header(fd, b, &hdr) == 0) {
-                                                                               entries[count].oid = hdr.oid;
-                                                                               entries[count].block = b;
-                                                                               count++;
-                                                                           }
-                                                                       }
-                                                                       // Escribir en objeto OID_MAP (bloque 2)
-                                                                       uint8_t block[LCFS_BLOCK_SIZE] = {0};
-                                                                       lcfs_obj_header om;
-                                                                       memcpy(om.magic, LCFS_MAGIC, LCFS_MAGIC_LEN);
-                                                                       om.type = OBJ_TYPE_OID_MAP;
-                                                                       om.version = LCFS_VERSION;
-                                                                       om.oid = LCFS_OID_MAP_OID;
-                                                                       om.size = count * 16;
-                                                                       om.num_extents = 0;
-                                                                       om.header_crc = 0;
-                                                                       om.header_crc = header_crc(&om);
-                                                                       memcpy(block, &om, sizeof(om));
-                                                                       uint64_t *ptr = (uint64_t*)(block + LCFS_HEADER_SIZE);
-                                                                       for (uint64_t i = 0; i < count; i++) {
-                                                                           ptr[2*i] = entries[i].oid;
-                                                                           ptr[2*i+1] = entries[i].block;
-                                                                       }
-                                                                       lcfs_write_block(fd, LCFS_OID_MAP_OID, block);
-                                                                       free(entries);
-                                                                       return 0;
-                                                                   }
+                                                                                   int lcfs_unlink(int fd, lcfs_oid_t parent_oid, const char *name) {
+                                                                                       DEBUG_ENTER();
+                                                                                       DEBUG_PRINT("Unlink '%s' del padre OID %llu", name, parent_oid);
+                                                                                       lcfs_oid_t oid;
+                                                                                       uint16_t type;
+                                                                                       if (lcfs_lookup_name(fd, parent_oid, name, &oid, &type) < 0) return -1;
+                                                                                       if (type == OBJ_TYPE_DIR) {
+                                                                                           DEBUG_ERROR("'%s' es un directorio, use rmdir", name);
+                                                                                           errno = EISDIR;
+                                                                                           return -1;
+                                                                                       }
+                                                                                       if (lcfs_remove_dir_entry(fd, parent_oid, name) < 0) return -1;
+                                                                                       if (lcfs_delete_object(fd, oid) < 0) return -1;
+                                                                                       DEBUG_EXIT(0);
+                                                                                       return 0;
+                                                                                   }

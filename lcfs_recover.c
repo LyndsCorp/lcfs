@@ -46,7 +46,7 @@ int main(int argc, char *argv[]) {
         memcpy(&hdr, block, sizeof(hdr));
         if (memcmp(hdr.magic, LCFS_MAGIC, LCFS_MAGIC_LEN) != 0) continue;
         total_objects++;
-        if (hdr.header_crc == header_crc(&hdr)) {
+        if (lcfs_validate_header(&hdr) == 0) {
             object_info *obj = &objects[valid_objects];
             obj->oid = hdr.oid;
             obj->type = hdr.type;

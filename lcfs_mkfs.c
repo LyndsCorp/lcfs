@@ -1,11 +1,13 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "lcfs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
@@ -14,7 +16,7 @@ int main(int argc, char *argv[]) {
     }
     const char *path = argv[1];
     uint64_t size_mb = strtoull(argv[2], NULL, 10);
-    uint64_t total_bytes = size_mb * 1024 * 1024;
+    uint64_t total_bytes = size_mb * 1024ULL * 1024ULL;
     uint64_t total_blocks = total_bytes / LCFS_BLOCK_SIZE;
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
