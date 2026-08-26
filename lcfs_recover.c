@@ -33,28 +33,29 @@ static void make_unique_name(lcfs_oid_t oid, const char *orig_name,
     }
                              }
 
-                             // Comprueba si un OID ya está listado en un directorio (por OID, no por nombre)
-                             static int is_oid_in_dir(int fd, lcfs_oid_t dir_oid, lcfs_oid_t target_oid) {
+                             // Elimina todas las entradas de un directorio (usado para limpiar .lost+found)
+                             static int clear_directory_entries(int fd, lcfs_oid_t dir_oid) {
                                  uint64_t dir_block;
                                  if (lcfs_object_location(fd, dir_oid, &dir_block) < 0)
-                                     return 0;
+                                     return -1;
                                  uint8_t block[LCFS_BLOCK_SIZE];
                                  if (lcfs_read_block(fd, dir_block, block) < 0)
-                                     return 0;
+                                     return -1;
+
+                                 // Obtener el offset donde empiezan las entradas
                                  uint16_t dname_len;
                                  memcpy(&dname_len, block + LCFS_HEADER_SIZE, 2);
-                                 size_t pos = LCFS_HEADER_SIZE + 2 + dname_len;
-                                 while (pos + sizeof(lcfs_dir_entry) <= LCFS_BLOCK_SIZE) {
-                                     lcfs_dir_entry entry;
-                                     memcpy(&entry, block + pos, sizeof(entry));
-                                     if (entry.child_oid == 0)
-                                         break;
-                                     if (entry.child_oid == target_oid)
-                                         return 1; // ya existe
-                                         if (entry.name_len == 0 || entry.name_len > LCFS_MAX_NAME_LEN)
-                                             break; // entrada corrupta, detener
-                                             pos += sizeof(entry) + entry.name_len;
-                                 }
+                                 size_t data_start = LCFS_HEADER_SIZE + 2 + dname_len;
+
+                                 // Poner a cero toda la zona de entradas
+                                 memset(block + data_start, 0, LCFS_BLOCK_SIZE - data_start);
+
+                                 // Actualizar el encabezado: size = 0
+                                 lcfs_obj_header hdr;
+                                 memcpy(&hdr, block, sizeof(hdr));
+                                 hdr.size = 0;
+                                 if (lcfs_write_header(fd, dir_block, &hdr) < 0)
+                                     return -1;
                                  return 0;
                              }
 
@@ -175,6 +176,12 @@ static void make_unique_name(lcfs_oid_t oid, const char *orig_name,
                                      strcpy(objects[valid_objects].name, LOST_FOUND_NAME);
                                      objects[valid_objects].valid = 1;
                                      valid_objects++;
+                                 } else {
+                                     // Limpiar .lost+found para evitar duplicados de ejecuciones anteriores
+                                     printf("Limpiando entradas de %s...\n", LOST_FOUND_NAME);
+                                     if (clear_directory_entries(fd, lost_found_oid) < 0) {
+                                         printf("Error al limpiar %s\n", LOST_FOUND_NAME);
+                                     }
                                  }
 
                                  printf("\nReconstructing filesystem graph...\n");
@@ -203,13 +210,6 @@ static void make_unique_name(lcfs_oid_t oid, const char *orig_name,
                                      }
 
                                      if (!parent_found) {
-                                         // Si ya está en .lost+found, omitir (evitar duplicados)
-                                         if (is_oid_in_dir(fd, lost_found_oid, objects[i].oid)) {
-                                             printf("  OID %llu ya está en .lost+found, se omite.\n",
-                                                    (unsigned long long)objects[i].oid);
-                                             continue;
-                                         }
-
                                          orphan_count++;
                                          char new_name[LCFS_MAX_NAME_LEN + 1];
                                          make_unique_name(objects[i].oid, objects[i].name, new_name, sizeof(new_name));

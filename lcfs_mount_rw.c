@@ -147,23 +147,22 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                 lcfs_dir_entry entry;
                                 memcpy(&entry, block + pos, sizeof(entry));
 
-                                // Si la entrada está vacía, terminamos
                                 if (entry.child_oid == 0)
                                     break;
 
-                                // Si el nombre es inválido, saltamos esta entrada
-                                if (entry.name_len == 0 || entry.name_len > LCFS_MAX_NAME_LEN) {
-                                    pos += sizeof(lcfs_dir_entry) + entry.name_len;
-                                    continue;
-                                }
+                                // Validar name_len para no salirnos del bloque
+                                if (entry.name_len == 0 || entry.name_len > LCFS_MAX_NAME_LEN ||
+                                    pos + sizeof(lcfs_dir_entry) + entry.name_len > LCFS_BLOCK_SIZE) {
+                                    // Entrada corrupta, terminamos el listado
+                                    break;
+                                    }
 
-                                pos += sizeof(lcfs_dir_entry);
+                                    pos += sizeof(lcfs_dir_entry);
                                 char name[LCFS_MAX_NAME_LEN + 1];
                                 memcpy(name, block + pos, entry.name_len);
                                 name[entry.name_len] = '\0';
                                 pos += entry.name_len;
 
-                                // Añadir entrada válida
                                 filler(buf, name, NULL, 0, 0);
                             }
 

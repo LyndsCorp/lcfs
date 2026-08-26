@@ -113,7 +113,10 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                         static int lcfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                                                 off_t offset, struct fuse_file_info *fi,
                                                 enum fuse_readdir_flags flags) {
-                            (void)offset; (void)fi; (void)flags;
+                            (void)offset;
+                            (void)fi;
+                            (void)flags;
+
                             lcfs_oid_t dir_oid;
                             uint16_t dir_type;
                             if (resolve_path(path, &dir_oid, &dir_type) < 0)
@@ -127,6 +130,7 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                             uint64_t dir_block;
                             if (lcfs_object_location(lcfs_fd, dir_oid, &dir_block) < 0)
                                 return -EIO;
+
                             uint8_t block[LCFS_BLOCK_SIZE];
                             if (lcfs_read_block(lcfs_fd, dir_block, block) < 0)
                                 return -EIO;
@@ -134,17 +138,30 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                             uint16_t dname_len;
                             memcpy(&dname_len, block + LCFS_HEADER_SIZE, 2);
                             size_t pos = LCFS_HEADER_SIZE + 2 + dname_len;
+
                             while (pos + sizeof(lcfs_dir_entry) <= LCFS_BLOCK_SIZE) {
                                 lcfs_dir_entry entry;
                                 memcpy(&entry, block + pos, sizeof(entry));
-                                if (entry.child_oid == 0) break;
-                                pos += sizeof(entry);
+
+                                if (entry.child_oid == 0)
+                                    break;
+
+                                // Validar name_len para no salirnos del bloque
+                                if (entry.name_len == 0 || entry.name_len > LCFS_MAX_NAME_LEN ||
+                                    pos + sizeof(lcfs_dir_entry) + entry.name_len > LCFS_BLOCK_SIZE) {
+                                    // Entrada corrupta, terminamos el listado
+                                    break;
+                                    }
+
+                                    pos += sizeof(lcfs_dir_entry);
                                 char name[LCFS_MAX_NAME_LEN + 1];
                                 memcpy(name, block + pos, entry.name_len);
                                 name[entry.name_len] = '\0';
                                 pos += entry.name_len;
+
                                 filler(buf, name, NULL, 0, 0);
                             }
+
                             return 0;
                                                 }
 
