@@ -2,7 +2,9 @@ CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -O2
 LDFLAGS = -lfuse3
 
-all: lcfs-mkfs lcfs-mount lcfs-recover lcfs-info
+TARGETS = lcfs-mkfs lcfs-mount lcfs-recover lcfs-info
+
+all: $(TARGETS)
 
 lcfs-mkfs: lcfs_mkfs.c lcfs.c lcfs.h
 	$(CC) $(CFLAGS) -o $@ lcfs_mkfs.c lcfs.c
@@ -17,4 +19,4 @@ lcfs-info: lcfs_info.c lcfs.c lcfs.h
 	$(CC) $(CFLAGS) -o $@ lcfs_info.c lcfs.c
 
 clean:
-	rm -f lcfs-mkfs lcfs-mount lcfs-recover lcfs-info
+	rm -f $(TARGETS)
