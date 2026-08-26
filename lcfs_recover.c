@@ -173,7 +173,7 @@ static void make_unique_name(lcfs_oid_t oid, const char *orig_name,
                                  if (lcfs_rebuild_oid_map(fd) == 0)
                                      printf("OID map reconstruido.\n");
 
-                                 // Reconstruir entradas de todos los directorios, incluida la raíz
+                                 // Reconstruir entradas de directorios
                                  printf("\nReconstruyendo entradas de directorios...\n");
                                  for (uint64_t i = 0; i < valid_objects; i++) {
                                      if (!objects[i].valid || objects[i].type != OBJ_TYPE_DIR)

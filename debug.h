@@ -24,4 +24,4 @@ fprintf(stderr, "[DEBUG] <-- %s() returns %d\n", __func__, (ret))
 #define DEBUG_EXIT(ret) do {} while (0)
 #endif
 
-#endif /* LCFS_DEBUG_H */
+#endif
