@@ -33,6 +33,31 @@ static void make_unique_name(lcfs_oid_t oid, const char *orig_name,
     }
                              }
 
+                             // Comprueba si un OID ya está listado en un directorio (por OID, no por nombre)
+                             static int is_oid_in_dir(int fd, lcfs_oid_t dir_oid, lcfs_oid_t target_oid) {
+                                 uint64_t dir_block;
+                                 if (lcfs_object_location(fd, dir_oid, &dir_block) < 0)
+                                     return 0;
+                                 uint8_t block[LCFS_BLOCK_SIZE];
+                                 if (lcfs_read_block(fd, dir_block, block) < 0)
+                                     return 0;
+                                 uint16_t dname_len;
+                                 memcpy(&dname_len, block + LCFS_HEADER_SIZE, 2);
+                                 size_t pos = LCFS_HEADER_SIZE + 2 + dname_len;
+                                 while (pos + sizeof(lcfs_dir_entry) <= LCFS_BLOCK_SIZE) {
+                                     lcfs_dir_entry entry;
+                                     memcpy(&entry, block + pos, sizeof(entry));
+                                     if (entry.child_oid == 0)
+                                         break;
+                                     if (entry.child_oid == target_oid)
+                                         return 1; // ya existe
+                                         if (entry.name_len == 0 || entry.name_len > LCFS_MAX_NAME_LEN)
+                                             break; // entrada corrupta, detener
+                                             pos += sizeof(entry) + entry.name_len;
+                                 }
+                                 return 0;
+                             }
+
                              int main(int argc, char *argv[]) {
                                  if (argc != 2) {
                                      fprintf(stderr, "Uso: %s <dispositivo|imagen>\n", argv[0]);
@@ -135,7 +160,7 @@ static void make_unique_name(lcfs_oid_t oid, const char *orig_name,
                                          close(fd);
                                          return 1;
                                      }
-                                     // Añadir a la lista de objetos
+                                     // Añadir a la lista
                                      object_info *tmp = realloc(objects, (valid_objects + 1) * sizeof(object_info));
                                      if (!tmp) {
                                          free(objects);
@@ -178,6 +203,13 @@ static void make_unique_name(lcfs_oid_t oid, const char *orig_name,
                                      }
 
                                      if (!parent_found) {
+                                         // Si ya está en .lost+found, omitir (evitar duplicados)
+                                         if (is_oid_in_dir(fd, lost_found_oid, objects[i].oid)) {
+                                             printf("  OID %llu ya está en .lost+found, se omite.\n",
+                                                    (unsigned long long)objects[i].oid);
+                                             continue;
+                                         }
+
                                          orphan_count++;
                                          char new_name[LCFS_MAX_NAME_LEN + 1];
                                          make_unique_name(objects[i].oid, objects[i].name, new_name, sizeof(new_name));
@@ -187,40 +219,25 @@ static void make_unique_name(lcfs_oid_t oid, const char *orig_name,
                                                 objects[i].name[0] ? objects[i].name : "(vacío)",
                                                 new_name);
 
-                                         // Comprobar si ya existe ese nombre en .lost+found
-                                         lcfs_oid_t existing_oid;
-                                         uint16_t existing_type;
-                                         if (lcfs_lookup_name(fd, lost_found_oid, new_name,
-                                             &existing_oid, &existing_type) == 0) {
-                                             // Añadir sufijo numérico
-                                             for (int suffix = 1; suffix < 1000; suffix++) {
-                                                 snprintf(new_name, sizeof(new_name), "id_%llu_%d",
-                                                          (unsigned long long)objects[i].oid, suffix);
-                                                 if (lcfs_lookup_name(fd, lost_found_oid, new_name,
-                                                     &existing_oid, &existing_type) != 0) {
-                                                     break;
-                                                     }
-                                             }
-                                             }
-
-                                             if (lcfs_add_dir_entry(fd, lost_found_oid, objects[i].oid,
-                                                 objects[i].type, new_name) == 0) {
-                                                 // Actualizar parent_oid
-                                                 uint64_t obj_block;
-                                             if (lcfs_object_location(fd, objects[i].oid, &obj_block) == 0) {
-                                                 lcfs_obj_header hdr;
-                                                 if (lcfs_read_header(fd, obj_block, &hdr) == 0) {
-                                                     hdr.parent_oid = lost_found_oid;
-                                                     if (lcfs_write_header(fd, obj_block, &hdr) == 0) {
-                                                         printf("    Movido correctamente.\n");
-                                                     } else {
-                                                         printf("    Error al actualizar parent_oid.\n");
-                                                     }
-                                                 }
-                                             }
+                                         // Añadir entrada en .lost+found
+                                         if (lcfs_add_dir_entry(fd, lost_found_oid, objects[i].oid,
+                                             objects[i].type, new_name) == 0) {
+                                             // Actualizar parent_oid
+                                             uint64_t obj_block;
+                                         if (lcfs_object_location(fd, objects[i].oid, &obj_block) == 0) {
+                                             lcfs_obj_header hdr;
+                                             if (lcfs_read_header(fd, obj_block, &hdr) == 0) {
+                                                 hdr.parent_oid = lost_found_oid;
+                                                 if (lcfs_write_header(fd, obj_block, &hdr) == 0) {
+                                                     printf("    Movido correctamente.\n");
                                                  } else {
-                                                     printf("    Error al añadir entrada a .lost+found.\n");
+                                                     printf("    Error al actualizar parent_oid.\n");
                                                  }
+                                             }
+                                         }
+                                             } else {
+                                                 printf("    Error al añadir entrada a .lost+found.\n");
+                                             }
                                      }
                                  }
 
