@@ -194,28 +194,28 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
 
                                                                                            static int lcfs_statfs(const char *path, struct statvfs *stbuf) {
                                                                                                (void)path;
-                                                                                               // Obtener número total de bloques del dispositivo
                                                                                                off_t dev_size = lseek(lcfs_fd, 0, SEEK_END);
                                                                                                if (dev_size < 0) return -errno;
                                                                                                uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
 
-                                                                                               // Obtener bloques libres desde el free map
                                                                                                uint8_t *bitmap = NULL;
                                                                                                uint64_t bm_blocks = 0;
                                                                                                if (lcfs_get_free_map(lcfs_fd, &bitmap, &bm_blocks) < 0) {
-                                                                                                   // Si falla, asumir que todo está ocupado (peor caso)
+                                                                                                   // Si falla, asumir todo ocupado
                                                                                                    stbuf->f_blocks = total_blocks;
                                                                                                    stbuf->f_bfree = 0;
                                                                                                    stbuf->f_bavail = 0;
                                                                                                } else {
-                                                                                                   uint64_t total_bits = bm_blocks * LCFS_BLOCK_SIZE * 8;
                                                                                                    uint64_t free_blocks = 0;
-                                                                                                   for (uint64_t i = 0; i < total_bits; i++) {
+                                                                                                   // Contar solo hasta total_blocks, no hasta total_bits
+                                                                                                   for (uint64_t i = 0; i < total_blocks; i++) {
                                                                                                        uint64_t byte_idx = i / 8;
                                                                                                        uint8_t bit = 1 << (i % 8);
                                                                                                        if (!(bitmap[byte_idx] & bit)) free_blocks++;
                                                                                                    }
                                                                                                    free(bitmap);
+                                                                                                   // Por seguridad, acotar
+                                                                                                   if (free_blocks > total_blocks) free_blocks = total_blocks;
                                                                                                    stbuf->f_blocks = total_blocks;
                                                                                                    stbuf->f_bfree = free_blocks;
                                                                                                    stbuf->f_bavail = free_blocks;
@@ -223,7 +223,7 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
 
                                                                                                stbuf->f_bsize = LCFS_BLOCK_SIZE;
                                                                                                stbuf->f_frsize = LCFS_BLOCK_SIZE;
-                                                                                               stbuf->f_files = 0;          // No llevamos cuenta de inodos
+                                                                                               stbuf->f_files = 0;
                                                                                                stbuf->f_ffree = 0;
                                                                                                stbuf->f_favail = 0;
                                                                                                stbuf->f_fsid = 0;
@@ -251,38 +251,54 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
 
                                                                                            int main(int argc, char *argv[]) {
                                                                                                // Parsear --chmod XXX
-                                                                                               for (int i = 1; i < argc; i++) {
+                                                                                               mode_t default_mode = 0755;
+                                                                                               int i = 1;
+                                                                                               while (i < argc) {
                                                                                                    if (strcmp(argv[i], "--chmod") == 0 && i+1 < argc) {
                                                                                                        default_mode = strtol(argv[i+1], NULL, 8) & 0777;
-                                                                                                       // Eliminar --chmod y su valor de los argumentos
+                                                                                                       // Eliminar --chmod y su valor
                                                                                                        for (int j = i; j < argc-2; j++) {
                                                                                                            argv[j] = argv[j+2];
                                                                                                        }
                                                                                                        argc -= 2;
-                                                                                                       i--;
+                                                                                                   } else {
+                                                                                                       i++;
                                                                                                    }
                                                                                                }
 
-                                                                                               // Añadir opciones FUSE para fsname y subtype
-                                                                                               char *new_argv[argc + 4];
-                                                                                               new_argv[0] = argv[0];
-                                                                                               new_argv[1] = "-o";
-                                                                                               new_argv[2] = "fsname=lcfs,subtype=lcfs";
-                                                                                               for (int i = 1; i < argc; i++) {
-                                                                                                   new_argv[i+2] = argv[i];
-                                                                                               }
-                                                                                               argc += 2;
-
+                                                                                               // El primer argumento debe ser la imagen, el segundo el punto de montaje
                                                                                                if (argc < 3) {
                                                                                                    fprintf(stderr, "Uso: %s <imagen_lcfs> <punto_montaje> [opciones_fuse]\n", argv[0]);
                                                                                                    return 1;
                                                                                                }
                                                                                                const char *image = argv[1];
+                                                                                               const char *mountpoint = argv[2];
+
+                                                                                               // Abrir imagen
                                                                                                lcfs_fd = open(image, O_RDWR);
                                                                                                if (lcfs_fd < 0) {
                                                                                                    perror("open");
                                                                                                    return 1;
                                                                                                }
-                                                                                               // El punto de montaje es new_argv[2] (después de -o fsname...)
-                                                                                               return fuse_main(argc, new_argv, &lcfs_oper, NULL);
+
+                                                                                               // Construir nuevo argv para FUSE: programa, opciones, punto_montaje
+                                                                                               // Opciones fijas: fsname=lcfs, subtype=lcfs, y opciones adicionales del usuario (excepto --chmod ya eliminado)
+                                                                                               int fuse_argc = 0;
+                                                                                               char *fuse_argv[argc + 5];  // margen suficiente
+
+                                                                                               fuse_argv[fuse_argc++] = argv[0];
+                                                                                               fuse_argv[fuse_argc++] = "-o";
+                                                                                               fuse_argv[fuse_argc++] = "fsname=lcfs,subtype=lcfs";
+
+                                                                                               // Añadir opciones FUSE adicionales que no sean la imagen ni el punto de montaje
+                                                                                               for (int j = 3; j < argc; j++) {
+                                                                                                   // Ya eliminamos --chmod, así que el resto son opciones FUSE
+                                                                                                   fuse_argv[fuse_argc++] = argv[j];
+                                                                                               }
+
+                                                                                               // Añadir punto de montaje al final
+                                                                                               fuse_argv[fuse_argc++] = (char *)mountpoint;
+                                                                                               fuse_argv[fuse_argc] = NULL;  // por seguridad
+
+                                                                                               return fuse_main(fuse_argc, fuse_argv, &lcfs_oper, NULL);
                                                                                            }

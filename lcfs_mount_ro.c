@@ -126,25 +126,30 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                          off_t dev_size = lseek(lcfs_fd, 0, SEEK_END);
                                                                          if (dev_size < 0) return -errno;
                                                                          uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
+
                                                                          uint8_t *bitmap = NULL;
                                                                          uint64_t bm_blocks = 0;
                                                                          if (lcfs_get_free_map(lcfs_fd, &bitmap, &bm_blocks) < 0) {
+                                                                             // Si falla, asumir todo ocupado
                                                                              stbuf->f_blocks = total_blocks;
                                                                              stbuf->f_bfree = 0;
                                                                              stbuf->f_bavail = 0;
                                                                          } else {
-                                                                             uint64_t total_bits = bm_blocks * LCFS_BLOCK_SIZE * 8;
                                                                              uint64_t free_blocks = 0;
-                                                                             for (uint64_t i = 0; i < total_bits; i++) {
+                                                                             // Contar solo hasta total_blocks, no hasta total_bits
+                                                                             for (uint64_t i = 0; i < total_blocks; i++) {
                                                                                  uint64_t byte_idx = i / 8;
                                                                                  uint8_t bit = 1 << (i % 8);
                                                                                  if (!(bitmap[byte_idx] & bit)) free_blocks++;
                                                                              }
                                                                              free(bitmap);
+                                                                             // Por seguridad, acotar
+                                                                             if (free_blocks > total_blocks) free_blocks = total_blocks;
                                                                              stbuf->f_blocks = total_blocks;
                                                                              stbuf->f_bfree = free_blocks;
                                                                              stbuf->f_bavail = free_blocks;
                                                                          }
+
                                                                          stbuf->f_bsize = LCFS_BLOCK_SIZE;
                                                                          stbuf->f_frsize = LCFS_BLOCK_SIZE;
                                                                          stbuf->f_files = 0;
