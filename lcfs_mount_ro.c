@@ -9,16 +9,17 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <time.h>
 #include "lcfs.h"
 
 static int lcfs_fd;
+static mode_t default_mode = 0755;
 
 static int lcfs_getattr(const char *path, struct stat *stbuf,
                         struct fuse_file_info *fi) {
     (void)fi;
     memset(stbuf, 0, sizeof(struct stat));
-    // Asignar propietario y tiempos
     stbuf->st_uid = getuid();
     stbuf->st_gid = getgid();
     stbuf->st_atime = time(NULL);
@@ -26,7 +27,7 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
     stbuf->st_ctime = time(NULL);
 
     if (strcmp(path, "/") == 0) {
-        stbuf->st_mode = S_IFDIR | 0777;
+        stbuf->st_mode = S_IFDIR | default_mode;
         stbuf->st_nlink = 2;
         return 0;
     }
@@ -36,10 +37,10 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
     uint16_t child_type;
     if (lcfs_lookup_name(lcfs_fd, root_oid, name, &child_oid, &child_type) == 0) {
         if (child_type == OBJ_TYPE_DIR) {
-            stbuf->st_mode = S_IFDIR | 0777;
+            stbuf->st_mode = S_IFDIR | default_mode;
             stbuf->st_nlink = 2;
         } else if (child_type == OBJ_TYPE_FILE) {
-            stbuf->st_mode = S_IFREG | 0666;
+            stbuf->st_mode = S_IFREG | default_mode;
             stbuf->st_nlink = 1;
             uint32_t size;
             lcfs_get_object_size(lcfs_fd, child_oid, &size);
@@ -120,15 +121,69 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                          return -ENOENT;
                                                                      }
 
+                                                                     static int lcfs_statfs(const char *path, struct statvfs *stbuf) {
+                                                                         (void)path;
+                                                                         off_t dev_size = lseek(lcfs_fd, 0, SEEK_END);
+                                                                         if (dev_size < 0) return -errno;
+                                                                         uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
+                                                                         uint8_t *bitmap = NULL;
+                                                                         uint64_t bm_blocks = 0;
+                                                                         if (lcfs_get_free_map(lcfs_fd, &bitmap, &bm_blocks) < 0) {
+                                                                             stbuf->f_blocks = total_blocks;
+                                                                             stbuf->f_bfree = 0;
+                                                                             stbuf->f_bavail = 0;
+                                                                         } else {
+                                                                             uint64_t total_bits = bm_blocks * LCFS_BLOCK_SIZE * 8;
+                                                                             uint64_t free_blocks = 0;
+                                                                             for (uint64_t i = 0; i < total_bits; i++) {
+                                                                                 uint64_t byte_idx = i / 8;
+                                                                                 uint8_t bit = 1 << (i % 8);
+                                                                                 if (!(bitmap[byte_idx] & bit)) free_blocks++;
+                                                                             }
+                                                                             free(bitmap);
+                                                                             stbuf->f_blocks = total_blocks;
+                                                                             stbuf->f_bfree = free_blocks;
+                                                                             stbuf->f_bavail = free_blocks;
+                                                                         }
+                                                                         stbuf->f_bsize = LCFS_BLOCK_SIZE;
+                                                                         stbuf->f_frsize = LCFS_BLOCK_SIZE;
+                                                                         stbuf->f_files = 0;
+                                                                         stbuf->f_ffree = 0;
+                                                                         stbuf->f_favail = 0;
+                                                                         stbuf->f_fsid = 0;
+                                                                         stbuf->f_flag = 0;
+                                                                         stbuf->f_namemax = LCFS_MAX_NAME_LEN;
+                                                                         return 0;
+                                                                     }
+
                                                                      static struct fuse_operations lcfs_oper = {
                                                                          .getattr = lcfs_getattr,
                                                                          .readdir = lcfs_readdir,
                                                                          .open = lcfs_open,
                                                                          .read = lcfs_read,
                                                                          .readlink = lcfs_fuse_readlink,
+                                                                         .statfs = lcfs_statfs,
                                                                      };
 
                                                                      int main(int argc, char *argv[]) {
+                                                                         for (int i = 1; i < argc; i++) {
+                                                                             if (strcmp(argv[i], "--chmod") == 0 && i+1 < argc) {
+                                                                                 default_mode = strtol(argv[i+1], NULL, 8) & 0777;
+                                                                                 for (int j = i; j < argc-2; j++) {
+                                                                                     argv[j] = argv[j+2];
+                                                                                 }
+                                                                                 argc -= 2;
+                                                                                 i--;
+                                                                             }
+                                                                         }
+                                                                         char *new_argv[argc + 4];
+                                                                         new_argv[0] = argv[0];
+                                                                         new_argv[1] = "-o";
+                                                                         new_argv[2] = "fsname=lcfs,subtype=lcfs";
+                                                                         for (int i = 1; i < argc; i++) {
+                                                                             new_argv[i+2] = argv[i];
+                                                                         }
+                                                                         argc += 2;
                                                                          if (argc < 3) {
                                                                              fprintf(stderr, "Uso: %s <imagen_lcfs> <punto_montaje> [opciones_fuse]\n", argv[0]);
                                                                              return 1;
@@ -139,7 +194,5 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                              perror("open");
                                                                              return 1;
                                                                          }
-                                                                         argv[1] = argv[2];
-                                                                         argc--;
-                                                                         return fuse_main(argc, argv, &lcfs_oper, NULL);
+                                                                         return fuse_main(argc, new_argv, &lcfs_oper, NULL);
                                                                      }
