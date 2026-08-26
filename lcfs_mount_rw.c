@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <time.h>
-#include <limits.h>   // <-- Añadido para PATH_MAX
+#include <limits.h>
 #include "lcfs.h"
 
 static int lcfs_fd;
@@ -124,20 +124,18 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                             lcfs_oid_t dir_oid;
                             uint16_t dir_type;
                             if (resolve_path(path, &dir_oid, &dir_type) < 0)
-                                return -ENOENT;
-                            if (dir_type != OBJ_TYPE_DIR)
-                                return -ENOTDIR;
+                                return 0;  // Listado vacío en lugar de error
 
-                            filler(buf, ".", NULL, 0, 0);
+                                filler(buf, ".", NULL, 0, 0);
                             filler(buf, "..", NULL, 0, 0);
 
                             uint64_t dir_block;
                             if (lcfs_object_location(lcfs_fd, dir_oid, &dir_block) < 0)
-                                return -EIO;
+                                return 0;
 
                             uint8_t block[LCFS_BLOCK_SIZE];
                             if (lcfs_read_block(lcfs_fd, dir_block, block) < 0)
-                                return -EIO;
+                                return 0;
 
                             uint16_t dname_len;
                             memcpy(&dname_len, block + LCFS_HEADER_SIZE, 2);
@@ -150,11 +148,9 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                 if (entry.child_oid == 0)
                                     break;
 
-                                // Validar name_len para no salirnos del bloque
                                 if (entry.name_len == 0 || entry.name_len > LCFS_MAX_NAME_LEN ||
                                     pos + sizeof(lcfs_dir_entry) + entry.name_len > LCFS_BLOCK_SIZE) {
-                                    // Entrada corrupta, terminamos el listado
-                                    break;
+                                    break;  // Entrada corrupta, detenemos
                                     }
 
                                     pos += sizeof(lcfs_dir_entry);
@@ -213,10 +209,16 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
 
                                                                                                lcfs_oid_t parent_oid;
                                                                                                uint16_t parent_type;
-                                                                                               if (resolve_path(dir_path, &parent_oid, &parent_type) < 0)
-                                                                                                   return -ENOENT;
-                                                                                               if (parent_type != OBJ_TYPE_DIR)
-                                                                                                   return -ENOTDIR;
+
+                                                                                               if (strcmp(dir_path, "/") == 0) {
+                                                                                                   parent_oid = LCFS_ROOT_OID;
+                                                                                                   parent_type = OBJ_TYPE_DIR;
+                                                                                               } else {
+                                                                                                   if (resolve_path(dir_path, &parent_oid, &parent_type) < 0)
+                                                                                                       return -ENOENT;
+                                                                                                   if (parent_type != OBJ_TYPE_DIR)
+                                                                                                       return -ENOTDIR;
+                                                                                               }
 
                                                                                                lcfs_oid_t new_oid;
                                                                                                if (lcfs_create_object(lcfs_fd, OBJ_TYPE_FILE, parent_oid, name, &new_oid, NULL) < 0)
@@ -236,10 +238,16 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
 
                                                                                                lcfs_oid_t parent_oid;
                                                                                                uint16_t parent_type;
-                                                                                               if (resolve_path(dir_path, &parent_oid, &parent_type) < 0)
-                                                                                                   return -ENOENT;
-                                                                                               if (parent_type != OBJ_TYPE_DIR)
-                                                                                                   return -ENOTDIR;
+
+                                                                                               if (strcmp(dir_path, "/") == 0) {
+                                                                                                   parent_oid = LCFS_ROOT_OID;
+                                                                                                   parent_type = OBJ_TYPE_DIR;
+                                                                                               } else {
+                                                                                                   if (resolve_path(dir_path, &parent_oid, &parent_type) < 0)
+                                                                                                       return -ENOENT;
+                                                                                                   if (parent_type != OBJ_TYPE_DIR)
+                                                                                                       return -ENOTDIR;
+                                                                                               }
 
                                                                                                lcfs_oid_t new_oid;
                                                                                                if (lcfs_create_dir(lcfs_fd, parent_oid, name, &new_oid) < 0)
@@ -247,7 +255,6 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                                                return 0;
                                                                                            }
 
-                                                                                           // Renombrada para evitar conflicto con la función de la librería
                                                                                            static int lcfs_fuse_unlink(const char *path) {
                                                                                                char dir_path[PATH_MAX];
                                                                                                char name[LCFS_MAX_NAME_LEN + 1];
@@ -255,10 +262,16 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
 
                                                                                                lcfs_oid_t parent_oid;
                                                                                                uint16_t parent_type;
-                                                                                               if (resolve_path(dir_path, &parent_oid, &parent_type) < 0)
-                                                                                                   return -ENOENT;
-                                                                                               if (parent_type != OBJ_TYPE_DIR)
-                                                                                                   return -ENOTDIR;
+
+                                                                                               if (strcmp(dir_path, "/") == 0) {
+                                                                                                   parent_oid = LCFS_ROOT_OID;
+                                                                                                   parent_type = OBJ_TYPE_DIR;
+                                                                                               } else {
+                                                                                                   if (resolve_path(dir_path, &parent_oid, &parent_type) < 0)
+                                                                                                       return -ENOENT;
+                                                                                                   if (parent_type != OBJ_TYPE_DIR)
+                                                                                                       return -ENOTDIR;
+                                                                                               }
 
                                                                                                return lcfs_unlink(lcfs_fd, parent_oid, name);
                                                                                            }
@@ -268,7 +281,6 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                                                return -ENOTSUP;
                                                                                            }
 
-                                                                                           // Renombrada para evitar conflicto
                                                                                            static int lcfs_fuse_rename(const char *from, const char *to, unsigned int flags) {
                                                                                                (void)flags;
                                                                                                char from_dir[PATH_MAX], from_name[LCFS_MAX_NAME_LEN + 1];
@@ -278,12 +290,26 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
 
                                                                                                lcfs_oid_t from_parent_oid, to_parent_oid;
                                                                                                uint16_t from_parent_type, to_parent_type;
-                                                                                               if (resolve_path(from_dir, &from_parent_oid, &from_parent_type) < 0)
-                                                                                                   return -ENOENT;
-                                                                                               if (resolve_path(to_dir, &to_parent_oid, &to_parent_type) < 0)
-                                                                                                   return -ENOENT;
-                                                                                               if (from_parent_type != OBJ_TYPE_DIR || to_parent_type != OBJ_TYPE_DIR)
-                                                                                                   return -ENOTDIR;
+
+                                                                                               if (strcmp(from_dir, "/") == 0) {
+                                                                                                   from_parent_oid = LCFS_ROOT_OID;
+                                                                                                   from_parent_type = OBJ_TYPE_DIR;
+                                                                                               } else {
+                                                                                                   if (resolve_path(from_dir, &from_parent_oid, &from_parent_type) < 0)
+                                                                                                       return -ENOENT;
+                                                                                                   if (from_parent_type != OBJ_TYPE_DIR)
+                                                                                                       return -ENOTDIR;
+                                                                                               }
+
+                                                                                               if (strcmp(to_dir, "/") == 0) {
+                                                                                                   to_parent_oid = LCFS_ROOT_OID;
+                                                                                                   to_parent_type = OBJ_TYPE_DIR;
+                                                                                               } else {
+                                                                                                   if (resolve_path(to_dir, &to_parent_oid, &to_parent_type) < 0)
+                                                                                                       return -ENOENT;
+                                                                                                   if (to_parent_type != OBJ_TYPE_DIR)
+                                                                                                       return -ENOTDIR;
+                                                                                               }
 
                                                                                                return lcfs_rename(lcfs_fd, from_parent_oid, from_name, to_parent_oid, to_name);
                                                                                            }
@@ -306,10 +332,16 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
 
                                                                                                lcfs_oid_t parent_oid;
                                                                                                uint16_t parent_type;
-                                                                                               if (resolve_path(dir_path, &parent_oid, &parent_type) < 0)
-                                                                                                   return -ENOENT;
-                                                                                               if (parent_type != OBJ_TYPE_DIR)
-                                                                                                   return -ENOTDIR;
+
+                                                                                               if (strcmp(dir_path, "/") == 0) {
+                                                                                                   parent_oid = LCFS_ROOT_OID;
+                                                                                                   parent_type = OBJ_TYPE_DIR;
+                                                                                               } else {
+                                                                                                   if (resolve_path(dir_path, &parent_oid, &parent_type) < 0)
+                                                                                                       return -ENOENT;
+                                                                                                   if (parent_type != OBJ_TYPE_DIR)
+                                                                                                       return -ENOTDIR;
+                                                                                               }
 
                                                                                                lcfs_oid_t new_oid;
                                                                                                if (lcfs_create_symlink(lcfs_fd, parent_oid, name, target, &new_oid) < 0)
@@ -317,7 +349,6 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                                                return 0;
                                                                                            }
 
-                                                                                           // Renombrada para evitar conflicto
                                                                                            static int lcfs_fuse_readlink(const char *path, char *buf, size_t size) {
                                                                                                lcfs_oid_t oid;
                                                                                                uint16_t type;
@@ -384,12 +415,12 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                                                                        .write      = lcfs_write,
                                                                                                                        .create     = lcfs_create,
                                                                                                                        .mkdir      = lcfs_mkdir,
-                                                                                                                       .unlink     = lcfs_fuse_unlink,   // <-- nombre corregido
+                                                                                                                       .unlink     = lcfs_fuse_unlink,
                                                                                                                        .rmdir      = lcfs_rmdir,
-                                                                                                                       .rename     = lcfs_fuse_rename,   // <-- nombre corregido
+                                                                                                                       .rename     = lcfs_fuse_rename,
                                                                                                                        .truncate   = lcfs_truncate,
                                                                                                                        .symlink    = lcfs_symlink,
-                                                                                                                       .readlink   = lcfs_fuse_readlink, // <-- nombre corregido
+                                                                                                                       .readlink   = lcfs_fuse_readlink,
                                                                                                                        .chmod      = lcfs_chmod,
                                                                                                                        .utimens    = lcfs_utimens,
                                                                                                                        .statfs     = lcfs_statfs,
