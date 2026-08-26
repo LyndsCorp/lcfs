@@ -272,7 +272,6 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                                                return lcfs_unlink(lcfs_fd, parent_oid, name);
                                                                                            }
 
-                                                                                           // Renombrada para no colisionar con la función de la librería
                                                                                            static int lcfs_fuse_rmdir(const char *path) {
                                                                                                char dir_path[PATH_MAX];
                                                                                                char name[LCFS_MAX_NAME_LEN + 1];
@@ -290,7 +289,7 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                                                        return -ENOTDIR;
                                                                                                }
 
-                                                                                               return lcfs_rmdir(lcfs_fd, parent_oid, name);  // Ahora llama a la función de la librería
+                                                                                               return lcfs_rmdir(lcfs_fd, parent_oid, name);
                                                                                            }
 
                                                                                            static int lcfs_fuse_rename(const char *from, const char *to, unsigned int flags) {
@@ -420,6 +419,23 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                                                                        return 0;
                                                                                                                    }
 
+                                                                                                                   // ---------- Nuevas operaciones para asegurar persistencia ----------
+                                                                                                                   static int lcfs_flush(const char *path, struct fuse_file_info *fi) {
+                                                                                                                       (void)path;
+                                                                                                                       (void)fi;
+                                                                                                                       // Forzar escritura de todos los datos pendientes al dispositivo
+                                                                                                                       fsync(lcfs_fd);
+                                                                                                                       return 0;
+                                                                                                                   }
+
+                                                                                                                   static int lcfs_release(const char *path, struct fuse_file_info *fi) {
+                                                                                                                       (void)path;
+                                                                                                                       (void)fi;
+                                                                                                                       // También sincronizar al cerrar
+                                                                                                                       fsync(lcfs_fd);
+                                                                                                                       return 0;
+                                                                                                                   }
+
                                                                                                                    static struct fuse_operations lcfs_oper = {
                                                                                                                        .getattr    = lcfs_getattr,
                                                                                                                        .readdir    = lcfs_readdir,
@@ -429,7 +445,7 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                                                                        .create     = lcfs_create,
                                                                                                                        .mkdir      = lcfs_mkdir,
                                                                                                                        .unlink     = lcfs_fuse_unlink,
-                                                                                                                       .rmdir      = lcfs_fuse_rmdir,          // <-- nombre corregido
+                                                                                                                       .rmdir      = lcfs_fuse_rmdir,
                                                                                                                        .rename     = lcfs_fuse_rename,
                                                                                                                        .truncate   = lcfs_truncate,
                                                                                                                        .symlink    = lcfs_symlink,
@@ -437,6 +453,8 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                                                                        .chmod      = lcfs_chmod,
                                                                                                                        .utimens    = lcfs_utimens,
                                                                                                                        .statfs     = lcfs_statfs,
+                                                                                                                       .flush      = lcfs_flush,      // <--- nuevo
+                                                                                                                       .release    = lcfs_release,    // <--- nuevo
                                                                                                                    };
 
                                                                                                                    int main(int argc, char *argv[]) {
