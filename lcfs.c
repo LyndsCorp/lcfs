@@ -180,7 +180,11 @@ int lcfs_init_superblock(int fd, uint64_t total_blocks) {
         free(bitmap);
         return -1;
     }
+    // Marcar bloques de datos del free map (2..2+bm_blocks-1) como ocupados
     for (uint64_t i = 0; i < bm_blocks; i++) {
+        uint64_t byte_idx = (2 + i) / 8;
+        uint8_t bit = 1 << ((2 + i) % 8);
+        bitmap[byte_idx] |= bit;
         if (lcfs_write_block(fd, 2 + i, bitmap + i*LCFS_BLOCK_SIZE) < 0) {
             DEBUG_ERROR("No se pudo escribir bloque de datos del free map %llu", i);
             free(bitmap);
@@ -205,20 +209,20 @@ int lcfs_init_superblock(int fd, uint64_t total_blocks) {
         free(bitmap);
         return -1;
     }
-
-    // Marcar oid_map_block ocupado en bitmap
+    // Marcar OID map como ocupado
     uint64_t byte_idx = oid_map_block / 8;
     uint8_t bit = 1 << (oid_map_block % 8);
     bitmap[byte_idx] |= bit;
 
+    // Escribir bitmap actualizado (ahora incluye todos los bloques especiales)
     if (lcfs_set_free_map(fd, bitmap, bm_blocks) < 0) {
-        DEBUG_ERROR("No se pudo actualizar free map con oid_map_block");
+        DEBUG_ERROR("No se pudo actualizar free map");
         free(bitmap);
         return -1;
     }
     free(bitmap);
 
-    // Crear root
+    // Crear root (deberá tomar el primer bloque libre, que no será ninguno de los especiales)
     uint64_t root_blk;
     lcfs_oid_t root_oid;
     if (lcfs_create_object(fd, OBJ_TYPE_DIR, 0, "/", &root_oid, &root_blk) < 0) {
@@ -258,26 +262,41 @@ int lcfs_init_superblock(int fd, uint64_t total_blocks) {
     return 0;
 }
 
+// Localiza un objeto por OID escaneando todo el disco. No depende de OID map.
+int lcfs_object_location(int fd, lcfs_oid_t oid, uint64_t *block_num) {
+    DEBUG_ENTER();
+    DEBUG_PRINT("Buscando ubicación del OID %llu", oid);
+    off_t dev_size = lseek(fd, 0, SEEK_END);
+    uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
+    for (uint64_t b = 0; b < total_blocks; b++) {
+        lcfs_obj_header obj_hdr;
+        if (lcfs_read_header(fd, b, &obj_hdr) == 0 && obj_hdr.oid == oid) {
+            *block_num = b;
+            DEBUG_PRINT("Encontrado en bloque %llu", b);
+            DEBUG_EXIT(0);
+            return 0;
+        }
+    }
+    DEBUG_ERROR("OID %llu no encontrado en el disco", oid);
+    errno = ENOENT;
+    return -1;
+}
+
 int lcfs_get_free_map(int fd, uint8_t **bitmap, uint64_t *bitmap_blocks) {
     DEBUG_ENTER();
+    uint64_t map_block;
+    if (lcfs_object_location(fd, LCFS_FREE_MAP_OID, &map_block) < 0) {
+        DEBUG_ERROR("No se pudo localizar el free map por OID 1");
+        return -1;
+    }
     lcfs_obj_header hdr;
-    if (lcfs_read_header(fd, LCFS_FREE_MAP_OID, &hdr) < 0) {
-        DEBUG_ERROR("No se pudo leer encabezado del free map (OID 1)");
-        return -1;
-    }
-    if (hdr.type != OBJ_TYPE_FREE_MAP) {
-        DEBUG_ERROR("El OID 1 no es un free map");
-        return -1;
-    }
+    if (lcfs_read_header(fd, map_block, &hdr) < 0) return -1;
+    if (hdr.type != OBJ_TYPE_FREE_MAP) return -1;
     uint64_t bm_blocks = hdr.num_extents;
     uint8_t *bm = malloc(bm_blocks * LCFS_BLOCK_SIZE);
-    if (!bm) {
-        DEBUG_ERROR("No se pudo asignar memoria para free map");
-        return -1;
-    }
+    if (!bm) return -1;
     for (uint64_t i = 0; i < bm_blocks; i++) {
-        if (lcfs_read_block(fd, 2 + i, bm + i*LCFS_BLOCK_SIZE) < 0) {
-            DEBUG_ERROR("No se pudo leer bloque %llu del free map", i);
+        if (lcfs_read_block(fd, map_block + 1 + i, bm + i*LCFS_BLOCK_SIZE) < 0) {
             free(bm);
             return -1;
         }
@@ -290,15 +309,17 @@ int lcfs_get_free_map(int fd, uint8_t **bitmap, uint64_t *bitmap_blocks) {
 
 int lcfs_set_free_map(int fd, const uint8_t *bitmap, uint64_t bitmap_blocks) {
     DEBUG_ENTER();
+    uint64_t map_block;
+    if (lcfs_object_location(fd, LCFS_FREE_MAP_OID, &map_block) < 0) return -1;
     lcfs_obj_header hdr;
-    if (lcfs_read_header(fd, LCFS_FREE_MAP_OID, &hdr) < 0) return -1;
+    if (lcfs_read_header(fd, map_block, &hdr) < 0) return -1;
     hdr.size = bitmap_blocks * LCFS_BLOCK_SIZE;
     hdr.num_extents = bitmap_blocks;
     hdr.header_crc = 0;
     hdr.header_crc = header_crc(&hdr);
-    if (lcfs_write_header(fd, LCFS_FREE_MAP_OID, &hdr) < 0) return -1;
+    if (lcfs_write_header(fd, map_block, &hdr) < 0) return -1;
     for (uint64_t i = 0; i < bitmap_blocks; i++) {
-        if (lcfs_write_block(fd, 2 + i, bitmap + i*LCFS_BLOCK_SIZE) < 0) return -1;
+        if (lcfs_write_block(fd, map_block + 1 + i, bitmap + i*LCFS_BLOCK_SIZE) < 0) return -1;
     }
     DEBUG_EXIT(0);
     return 0;
@@ -353,12 +374,14 @@ int lcfs_free_block(int fd, uint64_t block_num) {
 int lcfs_oid_map_add(int fd, lcfs_oid_t oid, uint64_t block) {
     DEBUG_ENTER();
     DEBUG_PRINT("Añadiendo OID %llu -> bloque %llu al OID map", oid, block);
-    uint8_t map_block[LCFS_BLOCK_SIZE];
-    if (lcfs_read_block(fd, LCFS_OID_MAP_OID, map_block) < 0) return -1;
+    uint64_t map_block;
+    if (lcfs_object_location(fd, LCFS_OID_MAP_OID, &map_block) < 0) return -1;
+    uint8_t map_data[LCFS_BLOCK_SIZE];
+    if (lcfs_read_block(fd, map_block, map_data) < 0) return -1;
     lcfs_obj_header hdr;
-    memcpy(&hdr, map_block, sizeof(hdr));
-    if (memcmp(hdr.magic, LCFS_MAGIC, LCFS_MAGIC_LEN) != 0 || hdr.type != OBJ_TYPE_OID_MAP) {
-        DEBUG_ERROR("El bloque del OID map no es válido");
+    memcpy(&hdr, map_data, sizeof(hdr));
+    if (hdr.type != OBJ_TYPE_OID_MAP) {
+        DEBUG_ERROR("El objeto en bloque %llu no es OID map", map_block);
         return -1;
     }
     uint64_t count = hdr.size / 16;
@@ -367,14 +390,14 @@ int lcfs_oid_map_add(int fd, lcfs_oid_t oid, uint64_t block) {
         errno = ENOSPC;
         return -1;
     }
-    uint64_t *entries = (uint64_t*)(map_block + LCFS_HEADER_SIZE);
+    uint64_t *entries = (uint64_t*)(map_data + LCFS_HEADER_SIZE);
     entries[2*count] = oid;
     entries[2*count+1] = block;
     hdr.size += 16;
     hdr.header_crc = 0;
     hdr.header_crc = header_crc(&hdr);
-    memcpy(map_block, &hdr, sizeof(hdr));
-    if (lcfs_write_block(fd, LCFS_OID_MAP_OID, map_block) < 0) return -1;
+    memcpy(map_data, &hdr, sizeof(hdr));
+    if (lcfs_write_block(fd, map_block, map_data) < 0) return -1;
     DEBUG_EXIT(0);
     return 0;
 }
@@ -382,13 +405,15 @@ int lcfs_oid_map_add(int fd, lcfs_oid_t oid, uint64_t block) {
 int lcfs_oid_map_remove(int fd, lcfs_oid_t oid) {
     DEBUG_ENTER();
     DEBUG_PRINT("Eliminando OID %llu del OID map", oid);
-    uint8_t map_block[LCFS_BLOCK_SIZE];
-    if (lcfs_read_block(fd, LCFS_OID_MAP_OID, map_block) < 0) return -1;
+    uint64_t map_block;
+    if (lcfs_object_location(fd, LCFS_OID_MAP_OID, &map_block) < 0) return -1;
+    uint8_t map_data[LCFS_BLOCK_SIZE];
+    if (lcfs_read_block(fd, map_block, map_data) < 0) return -1;
     lcfs_obj_header hdr;
-    memcpy(&hdr, map_block, sizeof(hdr));
+    memcpy(&hdr, map_data, sizeof(hdr));
     if (hdr.type != OBJ_TYPE_OID_MAP) return -1;
     uint64_t count = hdr.size / 16;
-    uint64_t *entries = (uint64_t*)(map_block + LCFS_HEADER_SIZE);
+    uint64_t *entries = (uint64_t*)(map_data + LCFS_HEADER_SIZE);
     for (uint64_t i = 0; i < count; i++) {
         if (entries[2*i] == oid) {
             if (i != count-1) {
@@ -398,50 +423,13 @@ int lcfs_oid_map_remove(int fd, lcfs_oid_t oid) {
             hdr.size -= 16;
             hdr.header_crc = 0;
             hdr.header_crc = header_crc(&hdr);
-            memcpy(map_block, &hdr, sizeof(hdr));
-            if (lcfs_write_block(fd, LCFS_OID_MAP_OID, map_block) < 0) return -1;
+            memcpy(map_data, &hdr, sizeof(hdr));
+            if (lcfs_write_block(fd, map_block, map_data) < 0) return -1;
             DEBUG_EXIT(0);
             return 0;
         }
     }
     DEBUG_ERROR("OID %llu no encontrado en OID map", oid);
-    errno = ENOENT;
-    return -1;
-}
-
-int lcfs_object_location(int fd, lcfs_oid_t oid, uint64_t *block_num) {
-    DEBUG_ENTER();
-    DEBUG_PRINT("Buscando ubicación del OID %llu", oid);
-    uint8_t map_block[LCFS_BLOCK_SIZE];
-    if (lcfs_read_block(fd, LCFS_OID_MAP_OID, map_block) == 0) {
-        lcfs_obj_header hdr;
-        memcpy(&hdr, map_block, sizeof(hdr));
-        if (hdr.type == OBJ_TYPE_OID_MAP) {
-            uint64_t count = hdr.size / 16;
-            uint64_t *entries = (uint64_t*)(map_block + LCFS_HEADER_SIZE);
-            for (uint64_t i = 0; i < count; i++) {
-                if (entries[2*i] == oid) {
-                    *block_num = entries[2*i+1];
-                    DEBUG_PRINT("Encontrado en OID map: bloque %llu", *block_num);
-                    DEBUG_EXIT(0);
-                    return 0;
-                }
-            }
-        }
-    }
-    DEBUG_PRINT("No encontrado en OID map, escaneando disco...");
-    off_t dev_size = lseek(fd, 0, SEEK_END);
-    uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
-    for (uint64_t b = 0; b < total_blocks; b++) {
-        lcfs_obj_header obj_hdr;
-        if (lcfs_read_header(fd, b, &obj_hdr) == 0 && obj_hdr.oid == oid) {
-            *block_num = b;
-            DEBUG_PRINT("Encontrado por escaneo: bloque %llu", b);
-            DEBUG_EXIT(0);
-            return 0;
-        }
-    }
-    DEBUG_ERROR("OID %llu no encontrado en el disco", oid);
     errno = ENOENT;
     return -1;
 }
