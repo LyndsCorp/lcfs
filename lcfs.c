@@ -437,20 +437,18 @@ int lcfs_create_object(int fd, uint16_t type, lcfs_oid_t parent_oid,
                            lcfs_obj_header hdr;
                            if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
 
-                           // Liberar extents si es archivo/symlink
                            if ((hdr.type == OBJ_TYPE_FILE || hdr.type == OBJ_TYPE_SYMLINK) && hdr.num_extents > 0) {
+                               // Liberar el extent contiguo
                                uint8_t obj_block[LCFS_BLOCK_SIZE];
                                if (lcfs_read_block(fd, block, obj_block) == 0) {
                                    uint16_t name_len;
                                    memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
                                    size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
                                    lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
-                                   uint32_t num_extents = hdr.num_extents;
-                                   // Si hay tabla externa, leerla; simplificamos asumiendo que están en el bloque
-                                   for (uint32_t i = 0; i < num_extents; i++) {
-                                       if (extents[i].physical_block != 0) {
-                                           lcfs_free_block(fd, extents[i].physical_block);
-                                       }
+                                   uint64_t phys_start = extents[0].physical_block;
+                                   uint64_t num_blocks = (hdr.size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+                                   for (uint64_t i = 0; i < num_blocks; i++) {
+                                       lcfs_free_block(fd, phys_start + i);
                                    }
                                }
                            }
@@ -583,463 +581,469 @@ int lcfs_create_object(int fd, uint16_t type, lcfs_oid_t parent_oid,
                                                                        return 0;
                                                                    }
 
-                                                                   // Funciones de manejo de extents (nuevas)
+                                                                   // Funciones de archivo con extent contiguo único
 
-                                                                   static int lcfs_find_extent(const lcfs_extent *extents, uint32_t num_extents,
-                                                                                               uint64_t logical_block, uint64_t *extent_idx) {
-                                                                       for (uint32_t i = 0; i < num_extents; i++) {
-                                                                           if (logical_block >= extents[i].logical_block &&
-                                                                               logical_block < extents[i].logical_block + 1) {
-                                                                               *extent_idx = i;
-                                                                           return 0;
-                                                                               }
+                                                                   int lcfs_read_file(int fd, lcfs_oid_t oid, char *buf, size_t size, off_t offset) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Leyendo archivo OID %" PRIu64 ", size %zu, offset %ld", oid, size, offset);
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       if (hdr.type != OBJ_TYPE_FILE && hdr.type != OBJ_TYPE_SYMLINK) return -1;
+
+                                                                       if (offset >= (off_t)hdr.size) return 0;
+                                                                       if (size > (size_t)(hdr.size - offset)) size = hdr.size - offset;
+
+                                                                       size_t total_read = 0;
+                                                                       off_t cur_off = offset;
+                                                                       uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                       if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+
+                                                                       uint16_t name_len;
+                                                                       memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                       size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+
+                                                                       if (hdr.num_extents == 0) {
+                                                                           // Archivo inline
+                                                                           if (data_start + offset + size > LCFS_BLOCK_SIZE) size = LCFS_BLOCK_SIZE - data_start - offset;
+                                                                           memcpy(buf, obj_block + data_start + offset, size);
+                                                                           total_read = size;
+                                                                       } else {
+                                                                           // Un único extent contiguo
+                                                                           lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
+                                                                           uint64_t phys_start = extents[0].physical_block;
+                                                                           uint64_t num_blocks = (hdr.size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+
+                                                                           while (total_read < size && cur_off < (off_t)hdr.size) {
+                                                                               uint64_t block_idx = cur_off / LCFS_BLOCK_SIZE;
+                                                                               uint64_t off_in_block = cur_off % LCFS_BLOCK_SIZE;
+                                                                               uint64_t phys_block = phys_start + block_idx;
+                                                                               uint8_t data[LCFS_BLOCK_SIZE];
+                                                                               if (lcfs_read_block(fd, phys_block, data) < 0) return -1;
+                                                                               size_t len = LCFS_BLOCK_SIZE - off_in_block;
+                                                                               if (cur_off + len > hdr.size) len = hdr.size - cur_off;
+                                                                               if (len > size - total_read) len = size - total_read;
+                                                                               memcpy(buf + total_read, data + off_in_block, len);
+                                                                               total_read += len;
+                                                                               cur_off += len;
+                                                                           }
                                                                        }
-                                                                       return -1;
+                                                                       DEBUG_PRINT("Lectura devuelve %zu bytes", total_read);
+                                                                       DEBUG_EXIT(total_read);
+                                                                       return total_read;
+                                                                   }
+
+                                                                   int lcfs_write_file(int fd, lcfs_oid_t oid, const char *buf, size_t size, off_t offset) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Escribiendo archivo OID %" PRIu64 ", size %zu, offset %ld", oid, size, offset);
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       if (hdr.type != OBJ_TYPE_FILE) return -1;
+
+                                                                       uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                       if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                       uint16_t name_len;
+                                                                       memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                       size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+
+                                                                       if (hdr.num_extents == 0) {
+                                                                           // Archivo inline
+                                                                           if ((uint64_t)offset + size <= LCFS_BLOCK_SIZE - data_start) {
+                                                                               if (offset + size > hdr.size) hdr.size = offset + size;
+                                                                               memcpy(obj_block + data_start + offset, buf, size);
+                                                                               hdr.header_crc = 0;
+                                                                               hdr.header_crc = header_crc(&hdr);
+                                                                               memcpy(obj_block, &hdr, sizeof(hdr));
+                                                                               if (lcfs_write_block(fd, block, obj_block) < 0) return -1;
+                                                                               return size;
+                                                                           } else {
+                                                                               // Necesita extent contiguo: truncar para asignar
+                                                                               if (lcfs_truncate_file(fd, oid, offset + size) < 0) return -1;
+                                                                               // Recargar header y bloque
+                                                                               if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                               if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                               // Continuar con extents
+                                                                           }
+                                                                       }
+
+                                                                       // Archivo con extent contiguo
+                                                                       lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
+                                                                       uint64_t phys_start = extents[0].physical_block;
+                                                                       uint64_t num_blocks = (hdr.size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+
+                                                                       off_t cur_off = offset;
+                                                                       size_t total_written = 0;
+                                                                       while (total_written < size && cur_off < (off_t)hdr.size) {
+                                                                           uint64_t block_idx = cur_off / LCFS_BLOCK_SIZE;
+                                                                           uint64_t off_in_block = cur_off % LCFS_BLOCK_SIZE;
+                                                                           uint64_t phys_block = phys_start + block_idx;
+                                                                           uint8_t data[LCFS_BLOCK_SIZE];
+                                                                           if (lcfs_read_block(fd, phys_block, data) < 0) return -1;
+                                                                           size_t len = LCFS_BLOCK_SIZE - off_in_block;
+                                                                           if (cur_off + len > hdr.size) len = hdr.size - cur_off;
+                                                                           if (len > size - total_written) len = size - total_written;
+                                                                           memcpy(data + off_in_block, buf + total_written, len);
+                                                                           if (lcfs_write_block(fd, phys_block, data) < 0) return -1;
+                                                                           total_written += len;
+                                                                           cur_off += len;
+                                                                       }
+
+                                                                       if (offset + size > hdr.size) {
+                                                                           hdr.size = offset + size;
+                                                                           hdr.header_crc = 0;
+                                                                           hdr.header_crc = header_crc(&hdr);
+                                                                           memcpy(obj_block, &hdr, sizeof(hdr));
+                                                                           if (lcfs_write_block(fd, block, obj_block) < 0) return -1;
+                                                                       }
+                                                                       DEBUG_PRINT("Escritura devuelve %zu bytes", total_written);
+                                                                       DEBUG_EXIT(total_written);
+                                                                       return total_written;
+                                                                   }
+
+                                                                   int lcfs_truncate_file(int fd, lcfs_oid_t oid, off_t new_size) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Truncando archivo OID %" PRIu64 " a %ld bytes", oid, new_size);
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       if (hdr.type != OBJ_TYPE_FILE) return -1;
+
+                                                                       if (new_size < 0) new_size = 0;
+                                                                       size_t max_inline = LCFS_BLOCK_SIZE - LCFS_HEADER_SIZE - 2 - LCFS_MAX_NAME_LEN;
+
+                                                                       // Si el archivo cabe inline y no tiene extents, simplemente ajustar tamaño
+                                                                       if ((size_t)new_size <= max_inline && hdr.num_extents == 0) {
+                                                                           hdr.size = new_size;
+                                                                           hdr.header_crc = 0;
+                                                                           hdr.header_crc = header_crc(&hdr);
+                                                                           if (lcfs_write_header(fd, block, &hdr) < 0) return -1;
+                                                                           return 0;
+                                                                       }
+
+                                                                       // Obtener bloque principal y datos de nombre
+                                                                       uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                       if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                       uint16_t name_len;
+                                                                       memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                       size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+
+                                                                       // Si el archivo es inline y necesita crecer, asignar extent contiguo
+                                                                       if (hdr.num_extents == 0 && (size_t)new_size > max_inline) {
+                                                                           // Calcular número de bloques contiguos necesarios
+                                                                           uint64_t num_blocks = (new_size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+                                                                           uint64_t start_block;
+                                                                           // Buscar secuencia contigua de bloques libres
+                                                                           int found = 0;
+                                                                           for (uint64_t b = 0; b < (uint64_t)lseek(fd,0,SEEK_END)/LCFS_BLOCK_SIZE; b++) {
+                                                                               int ok = 1;
+                                                                               for (uint64_t i = 0; i < num_blocks; i++) {
+                                                                                   uint8_t *bm; uint64_t bm_blocks;
+                                                                                   if (lcfs_get_free_map(fd, &bm, &bm_blocks) < 0) return -1;
+                                                                                   uint64_t byte_idx = (b+i)/8;
+                                                                                   uint8_t bit = 1 << ((b+i)%8);
+                                                                                   if (bm[byte_idx] & bit) { ok = 0; free(bm); break; }
+                                                                                   free(bm);
+                                                                               }
+                                                                               if (ok) { start_block = b; found = 1; break; }
+                                                                           }
+                                                                           if (!found) {
+                                                                               DEBUG_ERROR("No se encontró secuencia contigua de %" PRIu64 " bloques", num_blocks);
+                                                                               errno = ENOSPC;
+                                                                               return -1;
+                                                                           }
+                                                                           // Marcar bloques como ocupados
+                                                                           for (uint64_t i = 0; i < num_blocks; i++) {
+                                                                               uint8_t *bm; uint64_t bm_blocks;
+                                                                               if (lcfs_get_free_map(fd, &bm, &bm_blocks) < 0) return -1;
+                                                                               uint64_t byte_idx = (start_block+i)/8;
+                                                                               uint8_t bit = 1 << ((start_block+i)%8);
+                                                                               bm[byte_idx] |= bit;
+                                                                               if (lcfs_set_free_map(fd, bm, bm_blocks) < 0) { free(bm); return -1; }
+                                                                               free(bm);
+                                                                           }
+                                                                           // Copiar datos inline al primer bloque del extent
+                                                                           if (hdr.size > 0) {
+                                                                               uint8_t inline_data[LCFS_BLOCK_SIZE];
+                                                                               memcpy(inline_data, obj_block + data_start, hdr.size);
+                                                                               // Escribir en el primer bloque físico
+                                                                               if (lcfs_write_block(fd, start_block, inline_data) < 0) return -1;
+                                                                           }
+                                                                           // Actualizar header con un único extent
+                                                                           lcfs_extent ext;
+                                                                           ext.logical_block = 0;
+                                                                           ext.physical_block = start_block;
+                                                                           memcpy(obj_block + data_start, &ext, sizeof(ext));
+                                                                           hdr.num_extents = 1;
+                                                                           hdr.size = new_size;
+                                                                           hdr.header_crc = 0;
+                                                                           hdr.header_crc = header_crc(&hdr);
+                                                                           memcpy(obj_block, &hdr, sizeof(hdr));
+                                                                           if (lcfs_write_block(fd, block, obj_block) < 0) return -1;
+                                                                           return 0;
+                                                                       }
+
+                                                                       // Si ya tiene extent contiguo, solo ajustar tamaño (no se soporta expansión automática)
+                                                                       // Para simplificar, si se expande más allá del extent actual, devolvemos error
+                                                                       if (hdr.num_extents > 0) {
+                                                                           uint64_t current_blocks = (hdr.size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+                                                                           uint64_t needed_blocks = (new_size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+                                                                           if (needed_blocks > current_blocks) {
+                                                                               DEBUG_ERROR("No se soporta expansión de extent existente");
+                                                                               errno = ENOSPC;
+                                                                               return -1;
+                                                                           }
+                                                                           // Reducir tamaño si es necesario
+                                                                           hdr.size = new_size;
+                                                                           hdr.header_crc = 0;
+                                                                           hdr.header_crc = header_crc(&hdr);
+                                                                           memcpy(obj_block, &hdr, sizeof(hdr));
+                                                                           if (lcfs_write_block(fd, block, obj_block) < 0) return -1;
+                                                                           return 0;
+                                                                       }
+
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
+                                                                   }
+
+                                                                   int lcfs_get_object_size(int fd, lcfs_oid_t oid, uint32_t *size) {
+                                                                       DEBUG_ENTER();
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       *size = hdr.size;
+                                                                       DEBUG_PRINT("Tamaño del objeto OID %" PRIu64 ": %u", oid, *size);
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
+                                                                   }
+
+                                                                   int lcfs_readlink(int fd, lcfs_oid_t oid, char *buf, size_t bufsize) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Leyendo symlink OID %" PRIu64, oid);
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       if (hdr.type != OBJ_TYPE_SYMLINK) return -1;
+                                                                       if (hdr.num_extents == 0) {
+                                                                           uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                           if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                           uint16_t name_len;
+                                                                           memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                           size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                                                           size_t link_len = hdr.size;
+                                                                           if (link_len >= bufsize) link_len = bufsize - 1;
+                                                                           memcpy(buf, obj_block + data_start, link_len);
+                                                                           buf[link_len] = '\0';
+                                                                       } else {
+                                                                           char *tmp = malloc(hdr.size + 1);
+                                                                           if (!tmp) return -1;
+                                                                           lcfs_read_file(fd, oid, tmp, hdr.size, 0);
+                                                                           tmp[hdr.size] = '\0';
+                                                                           strncpy(buf, tmp, bufsize);
+                                                                           free(tmp);
+                                                                       }
+                                                                       DEBUG_PRINT("Target del symlink: '%s'", buf);
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
+                                                                   }
+
+                                                                   int lcfs_create_dir(int fd, lcfs_oid_t parent_oid, const char *name, lcfs_oid_t *new_oid) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Creando directorio '%s' en padre OID %" PRIu64, name, parent_oid);
+                                                                       lcfs_oid_t oid;
+                                                                       if (lcfs_create_object(fd, OBJ_TYPE_DIR, parent_oid, name, &oid, NULL) < 0) return -1;
+                                                                       if (lcfs_add_dir_entry(fd, parent_oid, oid, OBJ_TYPE_DIR, name) < 0) {
+                                                                           lcfs_delete_object(fd, oid);
+                                                                           return -1;
+                                                                       }
+                                                                       if (new_oid) *new_oid = oid;
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
+                                                                   }
+
+                                                                   int lcfs_create_symlink(int fd, lcfs_oid_t parent_oid, const char *name, const char *target, lcfs_oid_t *new_oid) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Creando symlink '%s' -> '%s' en padre OID %" PRIu64, name, target, parent_oid);
+                                                                       lcfs_oid_t oid;
+                                                                       if (lcfs_create_object(fd, OBJ_TYPE_SYMLINK, parent_oid, name, &oid, NULL) < 0) return -1;
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       uint8_t obj_block[LCFS_BLOCK_SIZE];
+                                                                       if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
+                                                                       uint16_t name_len;
+                                                                       memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
+                                                                       size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                                                       size_t target_len = strlen(target);
+                                                                       if (target_len > LCFS_BLOCK_SIZE - data_start) {
+                                                                           lcfs_delete_object(fd, oid);
+                                                                           errno = ENAMETOOLONG;
+                                                                           return -1;
+                                                                       }
+                                                                       memcpy(obj_block + data_start, target, target_len);
+                                                                       hdr.size = target_len;
+                                                                       hdr.header_crc = 0;
+                                                                       hdr.header_crc = header_crc(&hdr);
+                                                                       memcpy(obj_block, &hdr, sizeof(hdr));
+                                                                       if (lcfs_write_block(fd, block, obj_block) < 0) {
+                                                                           lcfs_delete_object(fd, oid);
+                                                                           return -1;
+                                                                       }
+                                                                       if (lcfs_add_dir_entry(fd, parent_oid, oid, OBJ_TYPE_SYMLINK, name) < 0) {
+                                                                           lcfs_delete_object(fd, oid);
+                                                                           return -1;
+                                                                       }
+                                                                       if (new_oid) *new_oid = oid;
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
+                                                                   }
+
+                                                                   int lcfs_rename(int fd, lcfs_oid_t old_parent, const char *old_name,
+                                                                                   lcfs_oid_t new_parent, const char *new_name) {
+                                                                       DEBUG_ENTER();
+                                                                       DEBUG_PRINT("Renombrando '%s' de padre %" PRIu64 " a '%s' en padre %" PRIu64,
+                                                                                   old_name, old_parent, new_name, new_parent);
+                                                                       lcfs_oid_t oid;
+                                                                       uint16_t type;
+                                                                       if (lcfs_lookup_name(fd, old_parent, old_name, &oid, &type) < 0) return -1;
+                                                                       lcfs_oid_t dummy;
+                                                                       if (lcfs_lookup_name(fd, new_parent, new_name, &dummy, &type) == 0) {
+                                                                           errno = EEXIST;
+                                                                           return -1;
+                                                                       }
+                                                                       if (lcfs_add_dir_entry(fd, new_parent, oid, type, new_name) < 0) return -1;
+                                                                       if (lcfs_remove_dir_entry(fd, old_parent, old_name) < 0) {
+                                                                           lcfs_remove_dir_entry(fd, new_parent, new_name);
+                                                                           return -1;
+                                                                       }
+                                                                       uint64_t block;
+                                                                       if (lcfs_object_location(fd, oid, &block) < 0) return -1;
+                                                                       lcfs_obj_header hdr;
+                                                                       if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
+                                                                       hdr.parent_oid = new_parent;
+                                                                       hdr.header_crc = 0;
+                                                                       hdr.header_crc = header_crc(&hdr);
+                                                                       if (lcfs_write_header(fd, block, &hdr) < 0) return -1;
+                                                                       DEBUG_EXIT(0);
+                                                                       return 0;
+                                                                                   }
+
+                                                                                   int lcfs_unlink(int fd, lcfs_oid_t parent_oid, const char *name) {
+                                                                                       DEBUG_ENTER();
+                                                                                       DEBUG_PRINT("Unlink '%s' del padre OID %" PRIu64, name, parent_oid);
+                                                                                       lcfs_oid_t oid;
+                                                                                       uint16_t type;
+                                                                                       if (lcfs_lookup_name(fd, parent_oid, name, &oid, &type) < 0) return -1;
+                                                                                       if (type == OBJ_TYPE_DIR) {
+                                                                                           DEBUG_ERROR("'%s' es un directorio, use rmdir", name);
+                                                                                           errno = EISDIR;
+                                                                                           return -1;
+                                                                                       }
+                                                                                       if (lcfs_remove_dir_entry(fd, parent_oid, name) < 0) return -1;
+                                                                                       if (lcfs_delete_object(fd, oid) < 0) return -1;
+                                                                                       DEBUG_EXIT(0);
+                                                                                       return 0;
+                                                                                   }
+
+                                                                                   int lcfs_rebuild_free_map(int fd, uint8_t **bitmap, uint64_t *bitmap_blocks) {
+                                                                                       DEBUG_ENTER();
+                                                                                       off_t dev_size = lseek(fd, 0, SEEK_END);
+                                                                                       uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
+                                                                                       uint64_t bm_blocks = (total_blocks + LCFS_BLOCK_SIZE*8 - 1) / (LCFS_BLOCK_SIZE*8);
+                                                                                       uint8_t *bm = calloc(bm_blocks, LCFS_BLOCK_SIZE);
+                                                                                       if (!bm) return -1;
+                                                                                       for (uint64_t b = 0; b < total_blocks; b++) {
+                                                                                           uint8_t block[LCFS_BLOCK_SIZE];
+                                                                                           if (lcfs_read_block(fd, b, block) < 0) continue;
+                                                                                           lcfs_obj_header hdr;
+                                                                                           memcpy(&hdr, block, sizeof(hdr));
+                                                                                           if (memcmp(hdr.magic, LCFS_MAGIC, LCFS_MAGIC_LEN) == 0 &&
+                                                                                               lcfs_validate_header(&hdr) == 0) {
+                                                                                               uint64_t byte_idx = b / 8;
+                                                                                           uint8_t bit = 1 << (b % 8);
+                                                                                           bm[byte_idx] |= bit;
+                                                                                           if ((hdr.type == OBJ_TYPE_FILE || hdr.type == OBJ_TYPE_SYMLINK) && hdr.num_extents > 0) {
+                                                                                               uint16_t name_len;
+                                                                                               memcpy(&name_len, block + LCFS_HEADER_SIZE, 2);
+                                                                                               size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                                                                               lcfs_extent *extents = (lcfs_extent*)(block + data_start);
+                                                                                               uint64_t phys_start = extents[0].physical_block;
+                                                                                               uint64_t num_blocks = (hdr.size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
+                                                                                               for (uint64_t i = 0; i < num_blocks; i++) {
+                                                                                                   uint64_t phys = phys_start + i;
+                                                                                                   if (phys < total_blocks) {
+                                                                                                       byte_idx = phys / 8;
+                                                                                                       bit = 1 << (phys % 8);
+                                                                                                       bm[byte_idx] |= bit;
+                                                                                                   }
                                                                                                }
-
-                                                                                               int lcfs_read_file(int fd, lcfs_oid_t oid, char *buf, size_t size, off_t offset) {
-                                                                                                   DEBUG_ENTER();
-                                                                                                   DEBUG_PRINT("Leyendo archivo OID %" PRIu64 ", size %zu, offset %ld", oid, size, offset);
-                                                                                                   uint64_t block;
-                                                                                                   if (lcfs_object_location(fd, oid, &block) < 0) return -1;
-                                                                                                   lcfs_obj_header hdr;
-                                                                                                   if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
-                                                                                                   if (hdr.type != OBJ_TYPE_FILE && hdr.type != OBJ_TYPE_SYMLINK) return -1;
-
-                                                                                                   if (offset >= (off_t)hdr.size) return 0;
-                                                                                                   if (size > (size_t)(hdr.size - offset)) size = hdr.size - offset;
-
-                                                                                                   size_t total_read = 0;
-                                                                                                   off_t cur_off = offset;
-                                                                                                   uint8_t obj_block[LCFS_BLOCK_SIZE];
-                                                                                                   if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
-
-                                                                                                   uint16_t name_len;
-                                                                                                   memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
-                                                                                                   size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
-
-                                                                                                   if (hdr.num_extents == 0) {
-                                                                                                       // Archivo inline
-                                                                                                       if (data_start + offset + size > LCFS_BLOCK_SIZE) size = LCFS_BLOCK_SIZE - data_start - offset;
-                                                                                                       memcpy(buf, obj_block + data_start + offset, size);
-                                                                                                       total_read = size;
-                                                                                                   } else {
-                                                                                                       // Extents en el bloque o en tablas externas (asumimos que caben en el bloque)
-                                                                                                       lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
-                                                                                                       uint32_t num_extents = hdr.num_extents;
-                                                                                                       while (total_read < size && cur_off < (off_t)hdr.size) {
-                                                                                                           uint64_t logical_block = cur_off / LCFS_BLOCK_SIZE;
-                                                                                                           uint64_t off_in_block = cur_off % LCFS_BLOCK_SIZE;
-                                                                                                           uint64_t extent_idx;
-                                                                                                           if (lcfs_find_extent(extents, num_extents, logical_block, &extent_idx) < 0) {
-                                                                                                               // Hueco -> leer ceros
-                                                                                                               size_t len = LCFS_BLOCK_SIZE - off_in_block;
-                                                                                                               if (cur_off + len > hdr.size) len = hdr.size - cur_off;
-                                                                                                               if (len > size - total_read) len = size - total_read;
-                                                                                                               memset(buf + total_read, 0, len);
-                                                                                                               total_read += len;
-                                                                                                               cur_off += len;
-                                                                                                               continue;
-                                                                                                           }
-                                                                                                           uint64_t phys_block = extents[extent_idx].physical_block +
-                                                                                                           (logical_block - extents[extent_idx].logical_block);
-                                                                                                           uint8_t data[LCFS_BLOCK_SIZE];
-                                                                                                           if (lcfs_read_block(fd, phys_block, data) < 0) return -1;
-                                                                                                           size_t len = LCFS_BLOCK_SIZE - off_in_block;
-                                                                                                           if (cur_off + len > hdr.size) len = hdr.size - cur_off;
-                                                                                                           if (len > size - total_read) len = size - total_read;
-                                                                                                           memcpy(buf + total_read, data + off_in_block, len);
-                                                                                                           total_read += len;
-                                                                                                           cur_off += len;
-                                                                                                       }
-                                                                                                   }
-                                                                                                   DEBUG_PRINT("Lectura devuelve %zu bytes", total_read);
-                                                                                                   DEBUG_EXIT(total_read);
-                                                                                                   return total_read;
+                                                                                           }
                                                                                                }
+                                                                                       }
+                                                                                       *bitmap = bm;
+                                                                                       *bitmap_blocks = bm_blocks;
+                                                                                       DEBUG_EXIT(0);
+                                                                                       return 0;
+                                                                                   }
 
-                                                                                               int lcfs_write_file(int fd, lcfs_oid_t oid, const char *buf, size_t size, off_t offset) {
-                                                                                                   DEBUG_ENTER();
-                                                                                                   DEBUG_PRINT("Escribiendo archivo OID %" PRIu64 ", size %zu, offset %ld", oid, size, offset);
-                                                                                                   uint64_t block;
-                                                                                                   if (lcfs_object_location(fd, oid, &block) < 0) return -1;
-                                                                                                   lcfs_obj_header hdr;
-                                                                                                   if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
-                                                                                                   if (hdr.type != OBJ_TYPE_FILE) return -1;
+                                                                                   int lcfs_rebuild_oid_map(int fd) {
+                                                                                       DEBUG_ENTER();
+                                                                                       off_t dev_size = lseek(fd, 0, SEEK_END);
+                                                                                       uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
+                                                                                       uint8_t *bitmap = NULL;
+                                                                                       uint64_t bm_blocks = 0;
+                                                                                       if (lcfs_rebuild_free_map(fd, &bitmap, &bm_blocks) < 0) return -1;
+                                                                                       free(bitmap);
 
-                                                                                                   uint8_t obj_block[LCFS_BLOCK_SIZE];
-                                                                                                   if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
-                                                                                                   uint16_t name_len;
-                                                                                                   memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
-                                                                                                   size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
+                                                                                       uint64_t map_block;
+                                                                                       if (lcfs_object_location(fd, LCFS_OID_MAP_OID, &map_block) < 0) {
+                                                                                           if (lcfs_alloc_block(fd, &map_block) < 0) return -1;
+                                                                                           lcfs_obj_header om;
+                                                                                           memset(&om, 0, sizeof(om));
+                                                                                           memcpy(om.magic, LCFS_MAGIC, LCFS_MAGIC_LEN);
+                                                                                           om.type = OBJ_TYPE_OID_MAP;
+                                                                                           om.version = LCFS_VERSION;
+                                                                                           om.oid = LCFS_OID_MAP_OID;
+                                                                                           om.size = 0;
+                                                                                           om.num_extents = 0;
+                                                                                           om.header_crc = 0;
+                                                                                           om.header_crc = header_crc(&om);
+                                                                                           if (lcfs_write_header(fd, map_block, &om) < 0) return -1;
+                                                                                       }
 
-                                                                                                   if (hdr.num_extents == 0) {
-                                                                                                       if ((uint64_t)offset + size <= LCFS_BLOCK_SIZE - data_start) {
-                                                                                                           if (offset + size > hdr.size) hdr.size = offset + size;
-                                                                                                           memcpy(obj_block + data_start + offset, buf, size);
-                                                                                                           hdr.header_crc = 0;
-                                                                                                           hdr.header_crc = header_crc(&hdr);
-                                                                                                           memcpy(obj_block, &hdr, sizeof(hdr));
-                                                                                                           if (lcfs_write_block(fd, block, obj_block) < 0) return -1;
-                                                                                                           return size;
-                                                                                                       } else {
-                                                                                                           // Necesita extents: truncar para asignar bloques
-                                                                                                           if (lcfs_truncate_file(fd, oid, offset + size) < 0) return -1;
-                                                                                                           if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
-                                                                                                           if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
-                                                                                                       }
-                                                                                                   }
+                                                                                       uint8_t map_data[LCFS_BLOCK_SIZE] = {0};
+                                                                                       if (lcfs_read_block(fd, map_block, map_data) < 0) return -1;
+                                                                                       lcfs_obj_header map_hdr;
+                                                                                       memcpy(&map_hdr, map_data, sizeof(map_hdr));
+                                                                                       uint64_t count = map_hdr.size / 16;
+                                                                                       uint64_t *entries = (uint64_t*)(map_data + LCFS_HEADER_SIZE);
 
-                                                                                                   // Archivo con extents
-                                                                                                   lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
-                                                                                                   uint32_t num_extents = hdr.num_extents;
-                                                                                                   off_t cur_off = offset;
-                                                                                                   size_t total_written = 0;
-                                                                                                   while (total_written < size && cur_off < (off_t)hdr.size) {
-                                                                                                       uint64_t logical_block = cur_off / LCFS_BLOCK_SIZE;
-                                                                                                       uint64_t off_in_block = cur_off % LCFS_BLOCK_SIZE;
-                                                                                                       uint64_t extent_idx;
-                                                                                                       if (lcfs_find_extent(extents, num_extents, logical_block, &extent_idx) < 0) {
-                                                                                                           break;
-                                                                                                       }
-                                                                                                       uint64_t phys_block = extents[extent_idx].physical_block +
-                                                                                                       (logical_block - extents[extent_idx].logical_block);
-                                                                                                       uint8_t data[LCFS_BLOCK_SIZE];
-                                                                                                       if (lcfs_read_block(fd, phys_block, data) < 0) return -1;
-                                                                                                       size_t len = LCFS_BLOCK_SIZE - off_in_block;
-                                                                                                       if (cur_off + len > hdr.size) len = hdr.size - cur_off;
-                                                                                                       if (len > size - total_written) len = size - total_written;
-                                                                                                       memcpy(data + off_in_block, buf + total_written, len);
-                                                                                                       if (lcfs_write_block(fd, phys_block, data) < 0) return -1;
-                                                                                                       total_written += len;
-                                                                                                       cur_off += len;
-                                                                                                   }
-                                                                                                   if (offset + size > hdr.size) {
-                                                                                                       hdr.size = offset + size;
-                                                                                                       hdr.header_crc = 0;
-                                                                                                       hdr.header_crc = header_crc(&hdr);
-                                                                                                       memcpy(obj_block, &hdr, sizeof(hdr));
-                                                                                                       if (lcfs_write_block(fd, block, obj_block) < 0) return -1;
-                                                                                                   }
-                                                                                                   DEBUG_PRINT("Escritura devuelve %zu bytes", total_written);
-                                                                                                   DEBUG_EXIT(total_written);
-                                                                                                   return total_written;
+                                                                                       for (uint64_t b = 0; b < total_blocks; b++) {
+                                                                                           lcfs_obj_header hdr;
+                                                                                           if (lcfs_read_header(fd, b, &hdr) == 0) {
+                                                                                               int exists = 0;
+                                                                                               for (uint64_t i = 0; i < count; i++) {
+                                                                                                   if (entries[2*i] == hdr.oid) { exists = 1; break; }
                                                                                                }
-
-                                                                                               int lcfs_truncate_file(int fd, lcfs_oid_t oid, off_t new_size) {
-                                                                                                   DEBUG_ENTER();
-                                                                                                   DEBUG_PRINT("Truncando archivo OID %" PRIu64 " a %ld bytes", oid, new_size);
-                                                                                                   uint64_t block;
-                                                                                                   if (lcfs_object_location(fd, oid, &block) < 0) return -1;
-                                                                                                   lcfs_obj_header hdr;
-                                                                                                   if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
-                                                                                                   if (hdr.type != OBJ_TYPE_FILE) return -1;
-
-                                                                                                   if (new_size < 0) new_size = 0;
-                                                                                                   size_t max_inline = LCFS_BLOCK_SIZE - LCFS_HEADER_SIZE - 2 - LCFS_MAX_NAME_LEN;
-                                                                                                   if ((size_t)new_size <= max_inline && hdr.num_extents == 0) {
-                                                                                                       hdr.size = new_size;
-                                                                                                       hdr.header_crc = 0;
-                                                                                                       hdr.header_crc = header_crc(&hdr);
-                                                                                                       if (lcfs_write_header(fd, block, &hdr) < 0) return -1;
-                                                                                                       return 0;
-                                                                                                   }
-
-                                                                                                   // Si el archivo tiene extents, liberar bloques sobrantes al reducir
-                                                                                                   uint64_t new_num_blocks = (new_size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
-                                                                                                   uint64_t current_num_blocks = (hdr.size + LCFS_BLOCK_SIZE - 1) / LCFS_BLOCK_SIZE;
-                                                                                                   uint8_t obj_block[LCFS_BLOCK_SIZE];
-                                                                                                   if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
-                                                                                                   uint16_t name_len;
-                                                                                                   memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
-                                                                                                   size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
-                                                                                                   lcfs_extent *extents = (lcfs_extent*)(obj_block + data_start);
-                                                                                                   uint32_t num_extents = hdr.num_extents;
-
-                                                                                                   if (new_num_blocks < current_num_blocks) {
-                                                                                                       for (uint32_t i = 0; i < num_extents; i++) {
-                                                                                                           uint64_t start = extents[i].logical_block;
-                                                                                                           uint64_t count = 1;
-                                                                                                           if (start + count > new_num_blocks) {
-                                                                                                               lcfs_free_block(fd, extents[i].physical_block);
-                                                                                                               // Eliminar extent
-                                                                                                               for (uint32_t k = i; k < num_extents - 1; k++) {
-                                                                                                                   extents[k] = extents[k+1];
-                                                                                                               }
-                                                                                                               num_extents--;
-                                                                                                               i--;
-                                                                                                           }
-                                                                                                       }
-                                                                                                       hdr.num_extents = num_extents;
-                                                                                                   }
-
-                                                                                                   if (new_num_blocks > current_num_blocks) {
-                                                                                                       // Añadir nuevos extents
-                                                                                                       for (uint64_t lb = current_num_blocks; lb < new_num_blocks; lb++) {
-                                                                                                           uint64_t phys;
-                                                                                                           if (lcfs_alloc_block(fd, &phys) < 0) return -1;
-                                                                                                           if (num_extents < (LCFS_BLOCK_SIZE - data_start) / sizeof(lcfs_extent)) {
-                                                                                                               extents[num_extents].logical_block = lb;
-                                                                                                               extents[num_extents].physical_block = phys;
-                                                                                                               num_extents++;
-                                                                                                           } else {
-                                                                                                               lcfs_free_block(fd, phys);
-                                                                                                               errno = ENOSPC;
-                                                                                                               return -1;
-                                                                                                           }
-                                                                                                       }
-                                                                                                       hdr.num_extents = num_extents;
-                                                                                                   }
-
-                                                                                                   hdr.size = new_size;
-                                                                                                   hdr.header_crc = 0;
-                                                                                                   hdr.header_crc = header_crc(&hdr);
-                                                                                                   memcpy(obj_block, &hdr, sizeof(hdr));
-                                                                                                   if (lcfs_write_block(fd, block, obj_block) < 0) return -1;
-                                                                                                   DEBUG_EXIT(0);
-                                                                                                   return 0;
+                                                                                               if (!exists) {
+                                                                                                   entries[2*count] = hdr.oid;
+                                                                                                   entries[2*count+1] = b;
+                                                                                                   count++;
+                                                                                                   if (count * 16 > LCFS_BLOCK_SIZE - LCFS_HEADER_SIZE) break;
                                                                                                }
-
-                                                                                               int lcfs_get_object_size(int fd, lcfs_oid_t oid, uint32_t *size) {
-                                                                                                   DEBUG_ENTER();
-                                                                                                   uint64_t block;
-                                                                                                   if (lcfs_object_location(fd, oid, &block) < 0) return -1;
-                                                                                                   lcfs_obj_header hdr;
-                                                                                                   if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
-                                                                                                   *size = hdr.size;
-                                                                                                   DEBUG_PRINT("Tamaño del objeto OID %" PRIu64 ": %u", oid, *size);
-                                                                                                   DEBUG_EXIT(0);
-                                                                                                   return 0;
-                                                                                               }
-
-                                                                                               int lcfs_readlink(int fd, lcfs_oid_t oid, char *buf, size_t bufsize) {
-                                                                                                   DEBUG_ENTER();
-                                                                                                   DEBUG_PRINT("Leyendo symlink OID %" PRIu64, oid);
-                                                                                                   uint64_t block;
-                                                                                                   if (lcfs_object_location(fd, oid, &block) < 0) return -1;
-                                                                                                   lcfs_obj_header hdr;
-                                                                                                   if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
-                                                                                                   if (hdr.type != OBJ_TYPE_SYMLINK) return -1;
-                                                                                                   if (hdr.num_extents == 0) {
-                                                                                                       uint8_t obj_block[LCFS_BLOCK_SIZE];
-                                                                                                       if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
-                                                                                                       uint16_t name_len;
-                                                                                                       memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
-                                                                                                       size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
-                                                                                                       size_t link_len = hdr.size;
-                                                                                                       if (link_len >= bufsize) link_len = bufsize - 1;
-                                                                                                       memcpy(buf, obj_block + data_start, link_len);
-                                                                                                       buf[link_len] = '\0';
-                                                                                                   } else {
-                                                                                                       char *tmp = malloc(hdr.size + 1);
-                                                                                                       if (!tmp) return -1;
-                                                                                                       lcfs_read_file(fd, oid, tmp, hdr.size, 0);
-                                                                                                       tmp[hdr.size] = '\0';
-                                                                                                       strncpy(buf, tmp, bufsize);
-                                                                                                       free(tmp);
-                                                                                                   }
-                                                                                                   DEBUG_PRINT("Target del symlink: '%s'", buf);
-                                                                                                   DEBUG_EXIT(0);
-                                                                                                   return 0;
-                                                                                               }
-
-                                                                                               int lcfs_create_dir(int fd, lcfs_oid_t parent_oid, const char *name, lcfs_oid_t *new_oid) {
-                                                                                                   DEBUG_ENTER();
-                                                                                                   DEBUG_PRINT("Creando directorio '%s' en padre OID %" PRIu64, name, parent_oid);
-                                                                                                   lcfs_oid_t oid;
-                                                                                                   if (lcfs_create_object(fd, OBJ_TYPE_DIR, parent_oid, name, &oid, NULL) < 0) return -1;
-                                                                                                   if (lcfs_add_dir_entry(fd, parent_oid, oid, OBJ_TYPE_DIR, name) < 0) {
-                                                                                                       lcfs_delete_object(fd, oid);
-                                                                                                       return -1;
-                                                                                                   }
-                                                                                                   if (new_oid) *new_oid = oid;
-                                                                                                   DEBUG_EXIT(0);
-                                                                                                   return 0;
-                                                                                               }
-
-                                                                                               int lcfs_create_symlink(int fd, lcfs_oid_t parent_oid, const char *name, const char *target, lcfs_oid_t *new_oid) {
-                                                                                                   DEBUG_ENTER();
-                                                                                                   DEBUG_PRINT("Creando symlink '%s' -> '%s' en padre OID %" PRIu64, name, target, parent_oid);
-                                                                                                   lcfs_oid_t oid;
-                                                                                                   if (lcfs_create_object(fd, OBJ_TYPE_SYMLINK, parent_oid, name, &oid, NULL) < 0) return -1;
-                                                                                                   uint64_t block;
-                                                                                                   if (lcfs_object_location(fd, oid, &block) < 0) return -1;
-                                                                                                   lcfs_obj_header hdr;
-                                                                                                   if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
-                                                                                                   uint8_t obj_block[LCFS_BLOCK_SIZE];
-                                                                                                   if (lcfs_read_block(fd, block, obj_block) < 0) return -1;
-                                                                                                   uint16_t name_len;
-                                                                                                   memcpy(&name_len, obj_block + LCFS_HEADER_SIZE, 2);
-                                                                                                   size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
-                                                                                                   size_t target_len = strlen(target);
-                                                                                                   if (target_len > LCFS_BLOCK_SIZE - data_start) {
-                                                                                                       lcfs_delete_object(fd, oid);
-                                                                                                       errno = ENAMETOOLONG;
-                                                                                                       return -1;
-                                                                                                   }
-                                                                                                   memcpy(obj_block + data_start, target, target_len);
-                                                                                                   hdr.size = target_len;
-                                                                                                   hdr.header_crc = 0;
-                                                                                                   hdr.header_crc = header_crc(&hdr);
-                                                                                                   memcpy(obj_block, &hdr, sizeof(hdr));
-                                                                                                   if (lcfs_write_block(fd, block, obj_block) < 0) {
-                                                                                                       lcfs_delete_object(fd, oid);
-                                                                                                       return -1;
-                                                                                                   }
-                                                                                                   if (lcfs_add_dir_entry(fd, parent_oid, oid, OBJ_TYPE_SYMLINK, name) < 0) {
-                                                                                                       lcfs_delete_object(fd, oid);
-                                                                                                       return -1;
-                                                                                                   }
-                                                                                                   if (new_oid) *new_oid = oid;
-                                                                                                   DEBUG_EXIT(0);
-                                                                                                   return 0;
-                                                                                               }
-
-                                                                                               int lcfs_rename(int fd, lcfs_oid_t old_parent, const char *old_name,
-                                                                                                               lcfs_oid_t new_parent, const char *new_name) {
-                                                                                                   DEBUG_ENTER();
-                                                                                                   DEBUG_PRINT("Renombrando '%s' de padre %" PRIu64 " a '%s' en padre %" PRIu64,
-                                                                                                               old_name, old_parent, new_name, new_parent);
-                                                                                                   lcfs_oid_t oid;
-                                                                                                   uint16_t type;
-                                                                                                   if (lcfs_lookup_name(fd, old_parent, old_name, &oid, &type) < 0) return -1;
-                                                                                                   lcfs_oid_t dummy;
-                                                                                                   if (lcfs_lookup_name(fd, new_parent, new_name, &dummy, &type) == 0) {
-                                                                                                       errno = EEXIST;
-                                                                                                       return -1;
-                                                                                                   }
-                                                                                                   if (lcfs_add_dir_entry(fd, new_parent, oid, type, new_name) < 0) return -1;
-                                                                                                   if (lcfs_remove_dir_entry(fd, old_parent, old_name) < 0) {
-                                                                                                       lcfs_remove_dir_entry(fd, new_parent, new_name);
-                                                                                                       return -1;
-                                                                                                   }
-                                                                                                   uint64_t block;
-                                                                                                   if (lcfs_object_location(fd, oid, &block) < 0) return -1;
-                                                                                                   lcfs_obj_header hdr;
-                                                                                                   if (lcfs_read_header(fd, block, &hdr) < 0) return -1;
-                                                                                                   hdr.parent_oid = new_parent;
-                                                                                                   hdr.header_crc = 0;
-                                                                                                   hdr.header_crc = header_crc(&hdr);
-                                                                                                   if (lcfs_write_header(fd, block, &hdr) < 0) return -1;
-                                                                                                   DEBUG_EXIT(0);
-                                                                                                   return 0;
-                                                                                                               }
-
-                                                                                                               int lcfs_unlink(int fd, lcfs_oid_t parent_oid, const char *name) {
-                                                                                                                   DEBUG_ENTER();
-                                                                                                                   DEBUG_PRINT("Unlink '%s' del padre OID %" PRIu64, name, parent_oid);
-                                                                                                                   lcfs_oid_t oid;
-                                                                                                                   uint16_t type;
-                                                                                                                   if (lcfs_lookup_name(fd, parent_oid, name, &oid, &type) < 0) return -1;
-                                                                                                                   if (type == OBJ_TYPE_DIR) {
-                                                                                                                       DEBUG_ERROR("'%s' es un directorio, use rmdir", name);
-                                                                                                                       errno = EISDIR;
-                                                                                                                       return -1;
-                                                                                                                   }
-                                                                                                                   if (lcfs_remove_dir_entry(fd, parent_oid, name) < 0) return -1;
-                                                                                                                   if (lcfs_delete_object(fd, oid) < 0) return -1;
-                                                                                                                   DEBUG_EXIT(0);
-                                                                                                                   return 0;
-                                                                                                               }
-
-                                                                                                               int lcfs_rebuild_free_map(int fd, uint8_t **bitmap, uint64_t *bitmap_blocks) {
-                                                                                                                   DEBUG_ENTER();
-                                                                                                                   off_t dev_size = lseek(fd, 0, SEEK_END);
-                                                                                                                   uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
-                                                                                                                   uint64_t bm_blocks = (total_blocks + LCFS_BLOCK_SIZE*8 - 1) / (LCFS_BLOCK_SIZE*8);
-                                                                                                                   uint8_t *bm = calloc(bm_blocks, LCFS_BLOCK_SIZE);
-                                                                                                                   if (!bm) return -1;
-                                                                                                                   for (uint64_t b = 0; b < total_blocks; b++) {
-                                                                                                                       uint8_t block[LCFS_BLOCK_SIZE];
-                                                                                                                       if (lcfs_read_block(fd, b, block) < 0) continue;
-                                                                                                                       lcfs_obj_header hdr;
-                                                                                                                       memcpy(&hdr, block, sizeof(hdr));
-                                                                                                                       if (memcmp(hdr.magic, LCFS_MAGIC, LCFS_MAGIC_LEN) == 0 &&
-                                                                                                                           lcfs_validate_header(&hdr) == 0) {
-                                                                                                                           uint64_t byte_idx = b / 8;
-                                                                                                                       uint8_t bit = 1 << (b % 8);
-                                                                                                                       bm[byte_idx] |= bit;
-                                                                                                                       if ((hdr.type == OBJ_TYPE_FILE || hdr.type == OBJ_TYPE_SYMLINK) && hdr.num_extents > 0) {
-                                                                                                                           uint16_t name_len;
-                                                                                                                           memcpy(&name_len, block + LCFS_HEADER_SIZE, 2);
-                                                                                                                           size_t data_start = LCFS_HEADER_SIZE + 2 + name_len;
-                                                                                                                           lcfs_extent *extents = (lcfs_extent*)(block + data_start);
-                                                                                                                           for (uint32_t i = 0; i < hdr.num_extents; i++) {
-                                                                                                                               uint64_t phys = extents[i].physical_block;
-                                                                                                                               if (phys < total_blocks) {
-                                                                                                                                   byte_idx = phys / 8;
-                                                                                                                                   bit = 1 << (phys % 8);
-                                                                                                                                   bm[byte_idx] |= bit;
-                                                                                                                               }
-                                                                                                                           }
-                                                                                                                       }
-                                                                                                                           }
-                                                                                                                   }
-                                                                                                                   *bitmap = bm;
-                                                                                                                   *bitmap_blocks = bm_blocks;
-                                                                                                                   DEBUG_EXIT(0);
-                                                                                                                   return 0;
-                                                                                                               }
-
-                                                                                                               int lcfs_rebuild_oid_map(int fd) {
-                                                                                                                   DEBUG_ENTER();
-                                                                                                                   off_t dev_size = lseek(fd, 0, SEEK_END);
-                                                                                                                   uint64_t total_blocks = dev_size / LCFS_BLOCK_SIZE;
-                                                                                                                   uint8_t *bitmap = NULL;
-                                                                                                                   uint64_t bm_blocks = 0;
-                                                                                                                   if (lcfs_rebuild_free_map(fd, &bitmap, &bm_blocks) < 0) return -1;
-                                                                                                                   free(bitmap);
-
-                                                                                                                   // Localizar OID map existente (si lo hay)
-                                                                                                                   uint64_t map_block;
-                                                                                                                   if (lcfs_object_location(fd, LCFS_OID_MAP_OID, &map_block) < 0) {
-                                                                                                                       // Crear nuevo OID map en un bloque libre
-                                                                                                                       if (lcfs_alloc_block(fd, &map_block) < 0) return -1;
-                                                                                                                       lcfs_obj_header om;
-                                                                                                                       memset(&om, 0, sizeof(om));
-                                                                                                                       memcpy(om.magic, LCFS_MAGIC, LCFS_MAGIC_LEN);
-                                                                                                                       om.type = OBJ_TYPE_OID_MAP;
-                                                                                                                       om.version = LCFS_VERSION;
-                                                                                                                       om.oid = LCFS_OID_MAP_OID;
-                                                                                                                       om.size = 0;
-                                                                                                                       om.num_extents = 0;
-                                                                                                                       om.header_crc = 0;
-                                                                                                                       om.header_crc = header_crc(&om);
-                                                                                                                       if (lcfs_write_header(fd, map_block, &om) < 0) return -1;
-                                                                                                                   }
-
-                                                                                                                   // Escanear todos los objetos válidos y añadirlos al mapa
-                                                                                                                   uint8_t map_data[LCFS_BLOCK_SIZE] = {0};
-                                                                                                                   lcfs_obj_header map_hdr;
-                                                                                                                   if (lcfs_read_header(fd, map_block, &map_hdr) < 0) return -1;
-                                                                                                                   uint64_t count = map_hdr.size / 16;
-                                                                                                                   uint64_t *entries = (uint64_t*)(map_data + LCFS_HEADER_SIZE);
-                                                                                                                   // Copiar entradas existentes
-                                                                                                                   if (lcfs_read_block(fd, map_block, map_data) < 0) return -1;
-                                                                                                                   entries = (uint64_t*)(map_data + LCFS_HEADER_SIZE);
-                                                                                                                   count = map_hdr.size / 16;
-
-                                                                                                                   for (uint64_t b = 0; b < total_blocks; b++) {
-                                                                                                                       lcfs_obj_header hdr;
-                                                                                                                       if (lcfs_read_header(fd, b, &hdr) == 0) {
-                                                                                                                           // Añadir al mapa (si no existe ya)
-                                                                                                                           int exists = 0;
-                                                                                                                           for (uint64_t i = 0; i < count; i++) {
-                                                                                                                               if (entries[2*i] == hdr.oid) { exists = 1; break; }
-                                                                                                                           }
-                                                                                                                           if (!exists) {
-                                                                                                                               entries[2*count] = hdr.oid;
-                                                                                                                               entries[2*count+1] = b;
-                                                                                                                               count++;
-                                                                                                                               if (count * 16 > LCFS_BLOCK_SIZE - LCFS_HEADER_SIZE) break; // lleno
-                                                                                                                           }
-                                                                                                                       }
-                                                                                                                   }
-                                                                                                                   map_hdr.size = count * 16;
-                                                                                                                   map_hdr.header_crc = 0;
-                                                                                                                   map_hdr.header_crc = header_crc(&map_hdr);
-                                                                                                                   memcpy(map_data, &map_hdr, sizeof(map_hdr));
-                                                                                                                   if (lcfs_write_block(fd, map_block, map_data) < 0) return -1;
-                                                                                                                   DEBUG_EXIT(0);
-                                                                                                                   return 0;
-                                                                                                               }
+                                                                                           }
+                                                                                       }
+                                                                                       map_hdr.size = count * 16;
+                                                                                       map_hdr.header_crc = 0;
+                                                                                       map_hdr.header_crc = header_crc(&map_hdr);
+                                                                                       memcpy(map_data, &map_hdr, sizeof(map_hdr));
+                                                                                       if (lcfs_write_block(fd, map_block, map_data) < 0) return -1;
+                                                                                       DEBUG_EXIT(0);
+                                                                                       return 0;
+                                                                                   }
