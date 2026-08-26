@@ -99,4 +99,6 @@ int lcfs_unlink(int fd, lcfs_oid_t parent_oid, const char *name);
 int lcfs_rmdir(int fd, lcfs_oid_t parent_oid, const char *name);
 int lcfs_validate_header(const lcfs_obj_header *hdr);
 
+int lcfs_sync(int fd);
+
 #endif

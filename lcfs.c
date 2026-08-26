@@ -721,6 +721,10 @@ int lcfs_object_location(int fd, lcfs_oid_t oid, uint64_t *block_num) {
         if (lcfs_read_header(fd, b, &obj_hdr) == 0 && obj_hdr.oid == oid) {
             *block_num = b;
             DEBUG_PRINT("Encontrado en bloque %" PRIu64 " (scan)", b);
+            // Reparar: añadir al mapa OID
+            if (oid != LCFS_OID_MAP_OID && oid != LCFS_FREE_MAP_OID && oid != LCFS_SUPERBLOCK_OID) {
+                lcfs_oid_map_add(fd, oid, b);
+            }
             DEBUG_EXIT(0);
             return 0;
         }
@@ -1224,7 +1228,6 @@ int lcfs_create_object(int fd, uint16_t type, lcfs_oid_t parent_oid,
                                                                                    extents[pos].block_count = 1;
                                                                                    num_extents++;
                                                                                    hdr.num_extents = num_extents;
-                                                                                   // No actualizamos size aquí, lo haremos al final
                                                                                    hdr.header_crc = 0;
                                                                                    hdr.header_crc = header_crc(&hdr);
                                                                                    memcpy(obj_block, &hdr, sizeof(hdr));
@@ -1265,16 +1268,12 @@ int lcfs_create_object(int fd, uint16_t type, lcfs_oid_t parent_oid,
                                                                            cur_off += len;
                                                                        }
 
-                                                                       // IMPORTANTE: Actualizar el tamaño del objeto si la escritura lo extendió
+                                                                       // Actualizar el tamaño si la escritura lo extendió
                                                                        if (offset + total_written > hdr.size) {
                                                                            hdr.size = offset + total_written;
                                                                        }
-                                                                       // También actualizar si ya se había expandido con truncate pero el tamaño no se reflejó
-                                                                       if ((uint64_t)offset + total_written > hdr.size) {
-                                                                           hdr.size = offset + total_written;
-                                                                       }
 
-                                                                       // Reescribir el encabezado del objeto con el nuevo tamaño y número de extents
+                                                                       // REESCRIBIR ENCABEZADO DEL OBJETO CON EL NUEVO TAMAÑO Y EXTENTS
                                                                        hdr.header_crc = 0;
                                                                        hdr.header_crc = header_crc(&hdr);
                                                                        memcpy(obj_block, &hdr, sizeof(hdr));
@@ -1717,4 +1716,8 @@ int lcfs_create_object(int fd, uint16_t type, lcfs_oid_t parent_oid,
                                                                                        free(data);
                                                                                        DEBUG_EXIT(0);
                                                                                        return 0;
+                                                                                   }
+
+                                                                                   int lcfs_sync(int fd) {
+                                                                                       return fsync(fd);
                                                                                    }
