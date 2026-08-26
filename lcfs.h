@@ -16,6 +16,7 @@
 #define LCFS_FREE_MAP_OID 1
 #define LCFS_OID_MAP_OID 2
 #define LCFS_SUPERBLOCK_OID 0
+#define LCFS_MAX_NAME_LEN 64
 
 typedef uint64_t lcfs_oid_t;
 
