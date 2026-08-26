@@ -1,0 +1,6 @@
+#!/bin/bash
+if [ $# -ne 1 ]; then
+    echo "Uso: $0 <punto_montaje>"
+    exit 1
+fi
+fusermount3 -u "$1" || fusermount -u "$1"
