@@ -9,11 +9,11 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "lcfs.h"
 
 static int lcfs_fd;
 
-// Función auxiliar para descomponer ruta simple (solo un nivel bajo root)
 static int path_to_oid(const char *path, lcfs_oid_t *oid, uint16_t *type) {
     lcfs_oid_t root_oid = LCFS_ROOT_OID;
     const char *name = path + 1;
@@ -24,6 +24,13 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                         struct fuse_file_info *fi) {
     (void)fi;
     memset(stbuf, 0, sizeof(struct stat));
+    // Asignar propietario y tiempos
+    stbuf->st_uid = getuid();
+    stbuf->st_gid = getgid();
+    stbuf->st_atime = time(NULL);
+    stbuf->st_mtime = time(NULL);
+    stbuf->st_ctime = time(NULL);
+
     if (strcmp(path, "/") == 0) {
         stbuf->st_mode = S_IFDIR | 0777;
         stbuf->st_nlink = 2;
@@ -143,7 +150,6 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                                                                                            }
 
                                                                                            static int lcfs_fuse_rmdir(const char *path) {
-                                                                                               // No implementado
                                                                                                (void)path;
                                                                                                return -ENOTSUP;
                                                                                            }

@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <time.h>
 #include "lcfs.h"
 
 static int lcfs_fd;
@@ -17,8 +18,15 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
                         struct fuse_file_info *fi) {
     (void)fi;
     memset(stbuf, 0, sizeof(struct stat));
+    // Asignar propietario y tiempos
+    stbuf->st_uid = getuid();
+    stbuf->st_gid = getgid();
+    stbuf->st_atime = time(NULL);
+    stbuf->st_mtime = time(NULL);
+    stbuf->st_ctime = time(NULL);
+
     if (strcmp(path, "/") == 0) {
-        stbuf->st_mode = S_IFDIR | 0555;
+        stbuf->st_mode = S_IFDIR | 0777;
         stbuf->st_nlink = 2;
         return 0;
     }
@@ -28,10 +36,10 @@ static int lcfs_getattr(const char *path, struct stat *stbuf,
     uint16_t child_type;
     if (lcfs_lookup_name(lcfs_fd, root_oid, name, &child_oid, &child_type) == 0) {
         if (child_type == OBJ_TYPE_DIR) {
-            stbuf->st_mode = S_IFDIR | 0555;
+            stbuf->st_mode = S_IFDIR | 0777;
             stbuf->st_nlink = 2;
         } else if (child_type == OBJ_TYPE_FILE) {
-            stbuf->st_mode = S_IFREG | 0444;
+            stbuf->st_mode = S_IFREG | 0666;
             stbuf->st_nlink = 1;
             uint32_t size;
             lcfs_get_object_size(lcfs_fd, child_oid, &size);
